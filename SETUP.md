@@ -11,11 +11,16 @@
 | Node.js | >= 18 | OHIF Viewer 构建需要 |
 | yarn | 1.22.x | OHIF 依赖安装（`npm i -g yarn`） |
 | Git | 任意新版 | 克隆仓库 |
+| Git LFS | 任意新版 | 仓库二进制资源走 LFS，克隆前需 `git lfs install` |
 | 显卡 | 可选 | 有 NVIDIA GPU 自动用 CUDA，否则 CPU 推理（较慢） |
 
 ## 1. 克隆仓库
 
+仓库的二进制资源（演示 DICOM、npy 测试数据、png 等）通过 **Git LFS** 存储，
+克隆前请先安装并初始化 LFS，否则只会拿到指针文件：
+
 ```bash
+git lfs install          # 一次性；未安装时: https://git-lfs.com 或 winget install GitHub.GitLFS
 git clone https://github.com/cw12309/radar.git
 cd radar
 ```
@@ -108,6 +113,7 @@ cd ohif-viewer && OHIF_PORT=3001 npm run dev &   # OHIF :3001
 | OHIF 页面打不开 | 等 `yarn install` 与首次 webpack 编译完成（日志 `logs/ohif.log`） |
 | PDF 中文乱码（Linux） | 系统缺中文字体；Windows 自带微软雅黑无需处理 |
 | 上传 DICOM 报 `Failed to fetch` | 见第 5 节路径长度提示 |
+| 克隆后 npy/dcm 文件只有几百字节 | 没装 Git LFS，执行 `git lfs install` 后 `git lfs pull` |
 
 ## 8. 目录速览
 
