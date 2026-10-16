@@ -1,0 +1,39 @@
+# RADAR 医学影像诊断平台 — Flask 后端 + 推理引擎依赖
+# 版本下限取自已验证可运行的环境（Python 3.10）。
+# 官方 RADAR 训练/推理依赖见仓库根目录 requirements.txt，二者需一起安装。
+
+# ---- Web 服务 ----
+Flask>=2.3
+Flask-CORS>=4.0
+Werkzeug>=2.3
+
+# ---- 数值与影像 IO ----
+numpy>=1.24,<2.0
+Pillow>=10.0
+nibabel>=5.1
+SimpleITK>=2.2
+pydicom>=2.4,<3.0
+scipy>=1.10
+
+# ---- PDF 诊断报告 ----
+reportlab>=4.0
+
+# ---- 图表（报告三视图分支） ----
+matplotlib>=3.7
+
+# ---- RADAR 推理引擎 ----
+torch>=1.10
+monai>=1.3
+transformers==4.25
+timm==0.4.12
+einops>=0.4.1
+omegaconf>=2.3
+fairscale==0.4.4
+ftfy
+sentencepiece
+iopath
+h5py
+batchgenerators
+tqdm
+pandas
+huggingface_hub

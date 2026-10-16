@@ -1,0 +1,42 @@
+# ---------- Python ----------
+__pycache__/
+*.py[cod]
+*.egg-info/
+.ipynb_checkpoints/
+.vscode/
+.idea/
+
+# ---------- 运行时产物 ----------
+logs/
+.dbg/
+.cache/
+.torch_cu126/
+results/
+radar_history.db
+*.log
+
+# ---------- 模型权重（用 download_scripts/download_checkpoints.py 从 HuggingFace 获取） ----------
+ckpt/*.pth
+ckpt/bert-base-chinese/
+ckpt/bert-base-uncased/
+ckpt/.cache/
+# 文本嵌入 infer_text_embedding_*.pt 不在 HF 仓库中，随本仓库分发，勿忽略
+
+# ---------- 大数据集（公开数据集，不入仓库） ----------
+# 仅保留内置演示 DICOM 序列与小体积测试数据，供克隆后直接体验
+data/*
+!data/README.md
+!data/TEST_DATA_GUIDE.md
+!data/test_ct_dicom_series/
+!data/test_ct_small.npy
+!data/test_ct_standard.npy
+!data/test_ct_single_slice.dcm
+!data/test_slice_2d.npy
+
+# ---------- 前端依赖与构建产物 ----------
+node_modules/
+ohif-viewer/platform/app/dist/
+
+# ---------- 训练标注（大 JSON，仅训练用） ----------
+merlin_labels.json
+merlin_report.json

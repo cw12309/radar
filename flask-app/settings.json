@@ -1,0 +1,7 @@
+{
+  "theme": "dark",
+  "language": "zh-CN",
+  "confidence_threshold": 0.5,
+  "use_gpu": true,
+  "viewer_source": "local5000"
+}

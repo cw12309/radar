@@ -1,0 +1,453 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>RADAR医学影像诊断平台 - 专业版</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/styles.css') }}">
+</head>
+<body>
+    <!-- 顶部导航栏 -->
+    <nav class="navbar">
+        <div class="navbar-container">
+            <div class="navbar-brand">
+                <div class="logo">🏥</div>
+                <div class="brand-text">
+                    <h1>RADAR</h1>
+                    <span>医学影像诊断平台</span>
+                </div>
+            </div>
+            <div class="navbar-menu">
+                <a href="#" class="nav-item active" data-page="diagnosis">
+                    <span class="icon">🔍</span>
+                    <span>影像诊断</span>
+                </a>
+                <a href="#" class="nav-item" data-page="batch">
+                    <span class="icon">📊</span>
+                    <span>批量处理</span>
+                </a>
+                <a href="#" class="nav-item" data-page="history">
+                    <span class="icon">📜</span>
+                    <span>历史记录</span>
+                </a>
+                <a href="#" class="nav-item" data-page="settings">
+                    <span class="icon">⚙️</span>
+                    <span>系统设置</span>
+                </a>
+            </div>
+            <div class="navbar-status">
+                <div class="status-indicator online"></div>
+                <span>系统在线</span>
+            </div>
+        </div>
+    </nav>
+
+    <!-- 主内容区 -->
+    <main class="main-container">
+        <!-- 影像诊断页面 -->
+        <div id="diagnosis-page" class="page active">
+            <div class="page-header">
+                <div class="workflow-kicker">RADAR · AI MEDICAL IMAGING</div>
+                <h2>腹部CT智能诊断</h2>
+                <p>上传影像后，系统将自动进入专业OHIF影像查看器，并在同一页面完成AI诊断。</p>
+            </div>
+
+            <div class="workflow-steps">
+                <div class="workflow-step active"><span>1</span><strong>上传影像</strong></div>
+                <div class="workflow-line"></div>
+                <div class="workflow-step" id="workflowViewerStep"><span>2</span><strong>查看影像</strong></div>
+                <div class="workflow-line"></div>
+                <div class="workflow-step" id="workflowDiagnosisStep"><span>3</span><strong>AI诊断</strong></div>
+                <div class="workflow-line"></div>
+                <div class="workflow-step" id="workflowReportStep"><span>4</span><strong>查看结果</strong></div>
+            </div>
+
+            <!-- 文件上传区 -->
+            <div class="upload-section card">
+                <div class="card-header">
+                    <h3>📤 上传影像文件</h3>
+                </div>
+                <div class="card-body">
+                    <div class="upload-area" id="uploadArea">
+                        <div class="upload-icon">📁</div>
+                        <p class="upload-text">拖拽文件夹 / 切片序列 / 体数据，或直接选择</p>
+                        <p class="upload-hint">支持 NIfTI体数据、整套DICOM序列（选文件夹 / 多选切片 / zip压缩包）、NumPy、PNG/JPG</p>
+                        <input type="file" id="fileInput" multiple accept=".nii,.gz,.npy,.dcm,.dicom,.png,.jpg,.jpeg,.zip,.tar,.tgz,.bz2" hidden>
+                        <input type="file" id="folderInput" webkitdirectory directory multiple hidden>
+                        <button class="btn btn-primary" onclick="document.getElementById('fileInput').click()">
+                            选择文件
+                        </button>
+                        <button class="btn btn-secondary" onclick="document.getElementById('folderInput').click()">
+                            选择文件夹
+                        </button>
+                    </div>
+                    
+                    <!-- 文件信息 -->
+                    <div id="fileInfo" class="file-info" style="display: none;">
+                        <div class="info-grid">
+                            <div class="info-item">
+                                <span class="info-label">文件名</span>
+                                <span class="info-value" id="fileName"></span>
+                            </div>
+                            <div class="info-item">
+                                <span class="info-label">格式类型</span>
+                                <span class="info-value" id="fileType"></span>
+                            </div>
+                            <div class="info-item">
+                                <span class="info-label">影像尺寸</span>
+                                <span class="info-value" id="fileShape"></span>
+                            </div>
+                            <div class="info-item">
+                                <span class="info-label">切片数量</span>
+                                <span class="info-value" id="fileSlices"></span>
+                            </div>
+                            <div class="info-item">
+                                <span class="info-label">体素间距</span>
+                                <span class="info-value" id="fileSpacing"></span>
+                            </div>
+                            <div class="info-item">
+                                <span class="info-label">文件大小</span>
+                                <span class="info-value" id="fileSize"></span>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- 患者与检查信息（从 DICOM / NIfTI 头读取） -->
+                    <div id="fileMeta" class="file-info file-meta" style="display: none;">
+                        <div class="file-meta-head">
+                            <h4 id="fileMetaTitle">检查信息</h4>
+                            <span class="file-meta-source" id="fileMetaSource"></span>
+                        </div>
+                        <div class="info-grid" id="fileMetaGrid"></div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- 影像查看器 -->
+            <div id="viewerSection" class="viewer-section" style="display: none;">
+                <div class="section-heading">
+                    <div><span class="section-index">02</span><h3>专业影像查看</h3></div>
+                    <span class="viewer-status"><i></i> OHIF Viewer · Cornerstone3D</span>
+                </div>
+
+                <div id="advancedViewer" class="viewer-panel active">
+                    <div class="viewer-container card">
+                        <div class="viewer-toolbar ohif-toolbar">
+                            <div class="toolbar-group">
+                                <span class="viewer-study-name" id="viewerStudyName">当前检查</span>
+                            </div>
+                            <a class="btn btn-secondary viewer-external-link" id="openOhifNewTab" href="#" target="_blank" rel="noopener">新窗口打开查看器 ↗</a>
+                        </div>
+                        <div class="viewer-content ohif-viewer-content">
+                            <iframe id="ohifViewerFrame" title="OHIF医学影像查看器" allow="fullscreen" style="width:100%;height:720px;border:0;background:#05070a;"></iframe>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- AI诊断按钮 -->
+            <div id="diagnoseSection" class="diagnose-section" style="display: none;">
+                <div class="section-heading">
+                    <div><span class="section-index">03</span><h3>AI辅助诊断</h3></div>
+                    <span class="diagnosis-note">AI结果仅供辅助参考，需由临床医生审核</span>
+                </div>
+                <button class="btn btn-primary btn-large" id="diagnoseBtn">
+                    <span class="btn-icon">✦</span>
+                    开始AI诊断
+                </button>
+            </div>
+
+            <!-- 诊断结果 -->
+            <div id="resultSection" class="result-section" style="display: none;">
+                <div class="result-header card">
+                    <div><span class="section-index">04</span><h3>诊断结果</h3></div>
+                    <div class="result-header-meta">
+                        <span class="result-status">分析完成</span>
+                        <span class="result-engine" id="resultEngine"></span>
+                    </div>
+                </div>
+
+                <!-- 患者与检查信息（诊断结果随附） -->
+                <div class="result-card card" id="resultMetaCard" style="display: none;">
+                    <div class="card-title-row">
+                        <h4>患者与检查信息</h4>
+                        <span class="card-title-note" id="resultMetaSource"></span>
+                    </div>
+                    <div class="info-grid" id="resultMetaGrid"></div>
+                </div>
+
+                <!-- 总体印象横幅 -->
+                <div class="impression-banner card" id="impressionBanner">
+                    <div class="impression-risk" id="impressionRisk">
+                        <div class="impression-risk-label">总体风险分级</div>
+                        <div class="impression-risk-value" id="overallRiskValue">-</div>
+                    </div>
+                    <div class="impression-summary">
+                        <div class="impression-headline" id="impressionHeadline"></div>
+                        <div class="impression-detail" id="impressionDetail"></div>
+                    </div>
+                </div>
+
+                <!-- 关键指标 -->
+                <div class="result-metrics">
+                    <div class="metric-card card">
+                        <div class="metric-label">阳性诊断项</div>
+                        <div class="metric-value" id="lesionCount">-</div>
+                        <div class="metric-hint" id="lesionCountHint">超过置信度阈值</div>
+                    </div>
+                    <div class="metric-card card">
+                        <div class="metric-label">最高置信度</div>
+                        <div class="metric-value" id="confidenceValue">-</div>
+                        <div class="metric-hint" id="confidenceHint">-</div>
+                    </div>
+                    <div class="metric-card card">
+                        <div class="metric-label">风险分级</div>
+                        <div class="metric-value metric-value-sm" id="severityValue">-</div>
+                        <div class="metric-hint" id="severityHint">取最高置信度项</div>
+                    </div>
+                    <div class="metric-card card">
+                        <div class="metric-label">分割器官</div>
+                        <div class="metric-value" id="organCount">-</div>
+                        <div class="metric-hint">RADAR 视觉分支识别</div>
+                    </div>
+                </div>
+
+                <!-- 影像学发现 -->
+                <div class="result-card card">
+                    <div class="card-title-row">
+                        <h4>影像学发现</h4>
+                        <div class="card-title-tools">
+                            <span class="severity-legend"><i class="dot dot-high"></i>高</span>
+                            <span class="severity-legend"><i class="dot dot-medium"></i>中</span>
+                            <span class="severity-legend"><i class="dot dot-low"></i>低</span>
+                            <button class="btn-text" id="toggleFindingsBtn" type="button">展开全部</button>
+                        </div>
+                    </div>
+                    <div id="findingsList" class="findings-grid"></div>
+                </div>
+
+                <div class="result-duo">
+                    <!-- 器官分割 -->
+                    <div class="result-card card">
+                        <div class="card-title-row">
+                            <h4>器官分割结果</h4>
+                            <span class="card-title-note" id="organNote"></span>
+                        </div>
+                        <div id="organChips" class="organ-chips"></div>
+                    </div>
+
+                    <!-- Top-N 诊断项得分 -->
+                    <div class="result-card card">
+                        <div class="card-title-row">
+                            <h4>诊断项得分排行</h4>
+                            <span class="card-title-note">视觉-文本匹配阳性概率</span>
+                        </div>
+                        <div id="topScoresChart" class="score-chart"></div>
+                    </div>
+                </div>
+
+                <!-- 分割叠加交互看片 -->
+                <div class="result-card card" id="overlayCard" style="display: none;">
+                    <div class="card-title-row">
+                        <h4>分割叠加 · 交互看片</h4>
+                        <div class="card-title-tools">
+                            <span class="card-title-note" id="overlayHint">滚轮/↑↓翻层 · 悬停查看器官 · 图例可跳转</span>
+                            <div class="overlay-mode-toggle" id="overlayModeToggle">
+                                <button type="button" class="mode-btn is-active" data-mode="2d">2D 切片</button>
+                                <button type="button" class="mode-btn" data-mode="3d">3D 重建</button>
+                            </div>
+                            <button class="btn-text" id="overlayAllOrgansBtn" type="button">全选器官</button>
+                            <button class="btn-text" id="overlayAffectedBtn" type="button">只看受累器官</button>
+                        </div>
+                    </div>
+
+                    <div class="overlay-body">
+                        <div class="overlay-stage" id="overlayStage">
+                            <canvas id="overlayCanvas"></canvas>
+                            <div class="overlay-cursor-tip" id="overlayCursorTip"></div>
+                            <div class="overlay-loading" id="overlayLoading">加载叠加数据…</div>
+                        </div>
+                        <div class="overlay-stage3d" id="overlayStage3d" hidden>
+                            <div class="stage3d-hint">拖拽旋转 · 滚轮缩放 · 右键平移</div>
+                            <div class="stage3d-loading" id="stage3dLoading" hidden>正在生成 3D 网格…</div>
+                            <div class="stage3d-error" id="stage3dError" hidden></div>
+                        </div>
+
+                        <div class="overlay-side">
+                            <div class="overlay-control">
+                                <label for="overlaySlice">轴位切片 <span id="overlaySliceVal">-</span></label>
+                                <input type="range" id="overlaySlice" min="0" max="0" value="0" step="1">
+                                <div class="overlay-play-row">
+                                    <button class="btn-text" id="overlayPlayBtn" type="button">▶ 播放</button>
+                                    <span class="overlay-size" id="overlaySize"></span>
+                                </div>
+                            </div>
+
+                            <div class="overlay-control">
+                                <label for="overlayOpacity">叠加透明度 <span id="overlayOpacityVal">45%</span></label>
+                                <input type="range" id="overlayOpacity" min="0" max="100" value="45" step="5">
+                            </div>
+
+                            <div class="overlay-control">
+                                <label for="overlayMode">渲染模式</label>
+                                <select id="overlayMode">
+                                    <option value="fill">填充叠加</option>
+                                    <option value="contour">仅轮廓</option>
+                                    <option value="heat">注意力热力</option>
+                                    <option value="ct">仅CT（隐藏叠加）</option>
+                                </select>
+                                <div class="overlay-heat-legend" id="overlayHeatLegend" hidden>
+                                    <span class="heat-grad"></span>
+                                    <span class="heat-scale"><i>低</i><i>置信度</i><i>高</i></span>
+                                    <span class="heat-note">热力强度 = 受累器官诊断项阳性概率</span>
+                                </div>
+                            </div>
+
+                            <div class="overlay-control">
+                                <label>器官图例 <span class="card-title-note" id="overlayLegendCount"></span></label>
+                                <div class="overlay-legend" id="overlayLegend"></div>
+                            </div>
+                        </div>
+
+                        <!-- 影像学发现速览列（看片时免翻页对照） -->
+                        <div class="overlay-findings" id="overlayFindings">
+                            <div class="overlay-findings-head">
+                                <span>影像学发现</span>
+                                <span class="card-title-note" id="overlayFindingsCount"></span>
+                            </div>
+                            <div class="overlay-findings-list" id="overlayFindingsList"></div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- 建议处理 -->
+                <div class="result-card card">
+                    <div class="card-title-row"><h4>建议处理</h4></div>
+                    <ul id="recommendationsList" class="recommendations-list"></ul>
+                </div>
+
+                <!-- 可解释性与证据 -->
+                <div class="result-card card">
+                    <div class="card-title-row">
+                        <h4>可解释性与证据</h4>
+                        <button class="btn-text" id="toggleExplanationBtn" type="button">展开全部</button>
+                    </div>
+                    <div class="explanation-block">
+                        <p class="explanation-lead" id="explanationMethod"></p>
+                        <p class="explanation-note" id="explanationSummary"></p>
+                        <div class="evidence-list" id="evidenceList"></div>
+                        <div class="limitations" id="limitationsBox"></div>
+                        <div class="inference-meta" id="inferenceMeta"></div>
+                    </div>
+                </div>
+
+                <div class="result-actions">
+                    <button class="btn btn-secondary" id="generateReportBtn">
+                        <span class="btn-icon">📄</span>
+                        生成PDF报告
+                    </button>
+                </div>
+            </div>
+        </div>
+
+        <!-- 批量处理页面 -->
+        <div id="batch-page" class="page">
+            <div class="page-header">
+                <h2>批量影像处理</h2>
+                <p>同时处理多个影像文件，提高工作效率</p>
+            </div>
+            <div class="batch-upload card">
+                <div class="card-header">
+                    <h3>批量上传</h3>
+                </div>
+                <div class="card-body">
+                    <input type="file" id="batchFileInput" multiple accept=".nii,.gz,.npy,.dcm,.dicom" hidden>
+                    <button class="btn btn-primary" onclick="document.getElementById('batchFileInput').click()">
+                        选择多个文件
+                    </button>
+                    <div id="batchResults" class="batch-results"></div>
+                </div>
+            </div>
+        </div>
+
+        <!-- 历史记录页面 -->
+        <div id="history-page" class="page">
+            <div class="page-header">
+                <h2>诊断历史记录</h2>
+                <p>查看和管理历史诊断记录</p>
+            </div>
+            <div class="history-list card">
+                <div class="card-header">
+                    <h3>历史记录</h3>
+                </div>
+                <div class="card-body">
+                    <div id="historyList" class="history-items"></div>
+                </div>
+            </div>
+        </div>
+
+        <!-- 系统设置页面 -->
+        <div id="settings-page" class="page">
+            <div class="page-header">
+                <h2>系统设置</h2>
+                <p>配置系统参数和偏好设置</p>
+            </div>
+            <div class="settings-grid">
+                <div class="settings-card card">
+                    <h3>界面设置</h3>
+                    <div class="setting-item">
+                        <label for="themeSetting">主题</label>
+                        <select id="themeSetting">
+                            <option value="dark">深色主题</option>
+                            <option value="light">浅色主题</option>
+                        </select>
+                    </div>
+                    <div class="setting-item">
+                        <label for="languageSetting">语言</label>
+                        <select id="languageSetting">
+                            <option value="zh-CN">中文</option>
+                            <option value="en">English</option>
+                        </select>
+                    </div>
+                </div>
+
+                <div class="settings-card card">
+                    <h3>AI模型设置</h3>
+                    <div class="setting-item">
+                        <label for="confidenceSetting">置信度阈值 <span id="confidenceSettingValue">70%</span></label>
+                        <input id="confidenceSetting" type="range" min="0" max="100" value="70">
+                    </div>
+                    <div class="setting-item">
+                        <label for="gpuSetting">使用GPU加速</label>
+                        <input id="gpuSetting" type="checkbox" checked>
+                    </div>
+                    <button class="btn btn-primary" id="saveSettingsBtn">保存设置</button>
+                </div>
+
+                <div class="settings-card card">
+                    <h3>系统信息</h3>
+                    <div class="info-item">
+                        <span>版本:</span>
+                        <span>v4.0 Flask专业版</span>
+                    </div>
+                    <div class="info-item">
+                        <span>最后更新:</span>
+                        <span>2026-09-30</span>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </main>
+
+    <!-- 加载提示 -->
+    <div id="loadingOverlay" class="loading-overlay" style="display: none;">
+        <div class="loading-spinner"></div>
+        <p id="loadingText">处理中...</p>
+    </div>
+
+    <!-- Toast通知 -->
+    <div id="toast" class="toast"></div>
+
+    <script src="{{ url_for('static', filename='js/app.js') }}"></script>
+</body>
+</html>
