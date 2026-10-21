@@ -803,13 +803,19 @@ const OverlayState = {
     meta: null,
     legend: [],
     affectedIds: new Set(),
-    // 器官标签 -> 该器官最高诊断置信度（注意力热力模式用）
+    // 器官标签 -> 该器官最高置信度（注意力热力模式用）
     organConfidence: new Map(),
+    // 器官名 -> 该器官最高置信度的诊断项（3D 病灶标注用）
+    organFinding: new Map(),
     visible: new Set(),
     slice: 0,
     opacity: 0.45,
     // 2D 渲染模式：fill 填充 / contour 轮廓 / heat 注意力热力 / ct 隐藏叠加
     renderMode: 'fill',
+    // 分割来源：full 后处理完整分割 / raw 模型原始输出 / fine TotalSegmentator
+    segSource: 'full',
+    // 3D 场景当前网格对应的分割来源（切换来源时需重建）
+    scene3dSource: null,
     // 视图模式：2d 切片 / 3d 重建
     mode: '2d',
     current: null,
@@ -842,13 +848,20 @@ async function initOverlayViewer(result) {
     OverlayState.current = null;
     OverlayState.slice = 0;
     OverlayState.loadSeq = 0;
+    // 新诊断的网格与旧文件不同：标记 3D 场景需重建，避免沿用旧器官网格
+    OverlayState.scene3dSource = null;
 
     // 器官 -> 最高置信度：注意力热力模式按它给受累器官着色
     OverlayState.organConfidence = new Map();
+    // 器官 -> 最高置信度的诊断项：3D 病灶标注显示发现名与置信度
+    OverlayState.organFinding = new Map();
     (result.diagnoses || []).forEach(d => {
         const c = Number(d.confidence) || 0;
         const prev = OverlayState.organConfidence.get(d.organ);
-        if (prev == null || c > prev) OverlayState.organConfidence.set(d.organ, c);
+        if (prev == null || c > prev) {
+            OverlayState.organConfidence.set(d.organ, c);
+            OverlayState.organFinding.set(d.organ, d);
+        }
     });
 
     const affectedNames = new Set((result.diagnoses || []).map(d => d.organ));
@@ -858,9 +871,24 @@ async function initOverlayViewer(result) {
 
     setOverlayLoading(true);
     try {
-        const resp = await fetch(`/api/overlay/${encodeURIComponent(fileId)}/meta`);
+        // 按当前选择的分割来源拉 meta；来源不可用（如 fine 未生成）回退 full
+        let resp = await fetch(
+            `/api/overlay/${encodeURIComponent(fileId)}/meta?mode=${encodeURIComponent(OverlayState.segSource)}`
+        );
+        if (!resp.ok && OverlayState.segSource !== 'full') {
+            OverlayState.segSource = 'full';
+            resp = await fetch(`/api/overlay/${encodeURIComponent(fileId)}/meta`);
+        }
         const data = await resp.json();
         if (!data.success) { card.style.display = 'none'; return; }
+
+        // 分割来源下拉：精细分割仅在后台生成完成后出现
+        const segSel = document.getElementById('overlaySegSource');
+        if (segSel) {
+            const fineOpt = segSel.querySelector('option[value="fine"]');
+            if (fineOpt) fineOpt.hidden = !data.has_fine;
+            if (segSel.value !== OverlayState.segSource) segSel.value = OverlayState.segSource;
+        }
 
         OverlayState.meta = data;
         OverlayState.legend = data.organ_legend || [];
@@ -1065,6 +1093,7 @@ async function loadOverlaySlice(idx) {
     try {
         const resp = await fetch(
             `/api/overlay/${encodeURIComponent(OverlayState.fileId)}/slice/${idx}`
+            + `?mode=${encodeURIComponent(OverlayState.segSource)}`
         );
         const data = await resp.json();
         if (!data.success) return;
@@ -1394,21 +1423,91 @@ function initScene3d() {
     return state;
 }
 
+// 用 canvas 画一块带文字的气泡，做成 three.js 精灵，作为 3D 病灶标注。
+// depthTest:false + 高 renderOrder，保证标签始终浮在器官表面之上、不被遮挡。
+function makeLabelSprite(THREE, lines, opts = {}) {
+    const pad = 18, lineH = 46, fontSize = 40;
+    const font = `bold ${fontSize}px "Microsoft YaHei","PingFang SC",sans-serif`;
+    const probe = document.createElement('canvas').getContext('2d');
+    probe.font = font;
+    let textW = 0;
+    lines.forEach(l => { textW = Math.max(textW, probe.measureText(l).width); });
+    const w = Math.ceil(textW + pad * 2 + 8);
+    const h = Math.ceil(lines.length * lineH + pad * 2);
+
+    const cv = document.createElement('canvas');
+    cv.width = w; cv.height = h;
+    const ctx = cv.getContext('2d');
+    // 圆角背景
+    const r = 16;
+    ctx.beginPath();
+    ctx.moveTo(r, 0); ctx.arcTo(w, 0, w, h, r); ctx.arcTo(w, h, 0, h, r);
+    ctx.arcTo(0, h, 0, 0, r); ctx.arcTo(0, 0, w, 0, r); ctx.closePath();
+    ctx.fillStyle = opts.bg || 'rgba(9,17,30,0.86)';
+    ctx.fill();
+    // 左侧强调色条
+    if (opts.accent) { ctx.fillStyle = opts.accent; ctx.fillRect(0, 0, 7, h); }
+    ctx.font = font; ctx.textBaseline = 'middle'; ctx.textAlign = 'left';
+    lines.forEach((l, i) => {
+        ctx.fillStyle = i === 0 ? '#ffffff' : (opts.subColor || '#ffcf4d');
+        ctx.fillText(l, pad + 4, pad + lineH * i + lineH / 2);
+    });
+
+    const tex = new THREE.CanvasTexture(cv);
+    tex.minFilter = THREE.LinearFilter;
+    const sprite = new THREE.Sprite(new THREE.SpriteMaterial({
+        map: tex, depthTest: false, transparent: true,
+    }));
+    const hh = opts.height || 34;   // 标签世界高度
+    sprite.scale.set(hh * w / h, hh, 1);
+    sprite.renderOrder = 999;
+    return sprite;
+}
+
 async function buildScene3d() {
-    const state = OverlayState.scene3d || initScene3d();
-    if (state.built) return;
     const loading = document.getElementById('stage3dLoading');
     const errBox = document.getElementById('stage3dError');
+    const src = OverlayState.segSource;
+    // 已构建且来源未变则只同步可见性，避免重复拉网格
+    if (OverlayState.scene3d && OverlayState.scene3d.built
+        && OverlayState.scene3dSource === src) {
+        syncScene3dVisibility();
+        return;
+    }
     errBox.hidden = true;
     loading.hidden = false;
     try {
+        // 必须先加载 three.js 再初始化场景：initScene3d 依赖 window.THREE，
+        // 旧代码在其之前调用会因 THREE 未定义抛错，导致 3D 永远卡在加载态。
         await loadThree();
-        const resp = await fetch(`/api/overlay/${encodeURIComponent(OverlayState.fileId)}/mesh`);
+        const state = OverlayState.scene3d || initScene3d();
+        // 切换分割来源时清空旧网格，重新拉取对应来源的网格
+        if (state.built) {
+            state.meshes.forEach(mesh => {
+                mesh.children.forEach(c => {
+                    if (c.material) {
+                        if (c.material.map) c.material.map.dispose();
+                        c.material.dispose();
+                    }
+                });
+                mesh.geometry.dispose();
+                mesh.material.dispose();
+            });
+            state.meshes.clear();
+            state.group.clear();
+            state.built = false;
+        }
+        const resp = await fetch(
+            `/api/overlay/${encodeURIComponent(OverlayState.fileId)}/mesh?mode=${encodeURIComponent(src)}`
+        );
+        if (!resp.ok) {
+            const detail = await resp.json().catch(() => ({}));
+            throw new Error(detail.message || `网格获取失败（HTTP ${resp.status}）`);
+        }
         const data = await resp.json();
         if (!data.success) throw new Error(data.message || '网格获取失败');
         const THREE = state.THREE;
         const [sz, sy, sx] = data.spacing;
-        const center = new THREE.Vector3();
         let count = 0;
         data.meshes.forEach(m => {
             const v = m.verts, f = m.faces;
@@ -1424,27 +1523,69 @@ async function buildScene3d() {
             geo.setIndex(f);
             geo.computeVertexNormals();
             geo.computeBoundingBox();
-            const mesh = new THREE.Mesh(geo, new THREE.MeshLambertMaterial({
-                color: new THREE.Color(`rgb(${m.color.join(',')})`),
-                transparent: true,
-                opacity: 0.92,
-                side: THREE.DoubleSide,
+
+            // 病灶标注：受累器官按诊断置信度走热力色并加悬浮标签，
+            // 其余器官降透明度作为解剖背景，突出模型发现的病灶。
+            // id=0 为后端从 CT 灰度提取的体表轮廓，常驻极低透明度作解剖参照。
+            const isBody = m.id === 0;
+            const isLesion = !isBody && OverlayState.affectedIds.has(m.id);
+            const conf = OverlayState.organConfidence.get(m.name);
+            let color, opacity;
+            if (isBody) {
+                color = new THREE.Color(`rgb(${m.color.join(',')})`);
+                opacity = 0.10;
+            } else if (isLesion && conf != null) {
+                const rgb = heatColor(conf);
+                color = new THREE.Color(rgb[0] / 255, rgb[1] / 255, rgb[2] / 255);
+                opacity = 0.97;
+            } else {
+                color = new THREE.Color(`rgb(${m.color.join(',')})`);
+                opacity = 0.22;
+            }
+            const mesh = new THREE.Mesh(geo, new THREE.MeshPhongMaterial({
+                color, transparent: true, opacity, side: THREE.DoubleSide,
+                shininess: isLesion ? 42 : 18,
+                specular: new THREE.Color(isLesion ? 0x303030 : 0x141414),
+                depthWrite: !isLesion && !isBody,  // 半透明层不写深度，避免遮挡标签
             }));
             mesh.name = m.name;
+            mesh.userData.lesion = isLesion;
+
+            if (isLesion) {
+                const d = OverlayState.organFinding.get(m.name) || {};
+                const rgb = heatColor(conf == null ? 0.5 : conf);
+                const accent = `rgb(${rgb.map(x => Math.round(x)).join(',')})`;
+                const label = makeLabelSprite(THREE, [
+                    m.name,
+                    `${d.finding || '异常发现'} ${conf != null ? pct(conf) : ''}`.trim(),
+                ], { accent });
+                // 定位到该器官包围盒顶部中心
+                const bb = geo.boundingBox;
+                label.position.set(
+                    (bb.min.x + bb.max.x) / 2,
+                    bb.max.y + 12,
+                    (bb.min.z + bb.max.z) / 2,
+                );
+                mesh.add(label);   // 作为器官子节点：器官隐藏时标签一并隐藏
+            }
+
             state.group.add(mesh);
             state.meshes.set(m.id, mesh);
             count += 1;
         });
         if (!count) throw new Error('没有可重建的器官网格');
         const box = new THREE.Box3().setFromObject(state.group);
+        const center = new THREE.Vector3();
         box.getCenter(center);
         state.target.copy(center);
         state.dist = box.getSize(new THREE.Vector3()).length() * 1.35;
         state.updateCamera();
         state.built = true;
+        OverlayState.scene3dSource = src;
         syncScene3dVisibility();
     } catch (e) {
-        errBox.textContent = e.message || String(e);
+        console.error('3D 重建失败:', e);
+        errBox.textContent = (e && e.message) ? e.message : String(e);
         errBox.hidden = false;
     } finally {
         loading.hidden = true;
@@ -1455,7 +1596,8 @@ function syncScene3dVisibility() {
     const state = OverlayState.scene3d;
     if (!state || !state.built) return;
     state.meshes.forEach((mesh, id) => {
-        mesh.visible = OverlayState.visible.has(id);
+        // id=0 体表轮廓常驻显示，不受器官图例勾选影响
+        mesh.visible = id === 0 ? true : OverlayState.visible.has(id);
     });
 }
 
@@ -1498,6 +1640,19 @@ function bindOverlayEvents() {
         document.getElementById('overlayOpacityVal').textContent = opacity.value + '%';
         renderOverlay();
     });
+
+    const segSource = document.getElementById('overlaySegSource');
+    if (segSource) {
+        segSource.addEventListener('change', async () => {
+            OverlayState.segSource = segSource.value;
+            OverlayState.cache.clear();
+            OverlayState.cacheOrder = [];
+            OverlayState.current = null;
+            await loadOverlaySlice(OverlayState.slice);
+            // 3D 已构建时按新来源重建网格
+            if (OverlayState.mode === '3d') await buildScene3d();
+        });
+    }
 
     const mode = document.getElementById('overlayMode');
     mode.addEventListener('change', () => {

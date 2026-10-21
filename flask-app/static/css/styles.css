@@ -7,6 +7,13 @@
     box-sizing: border-box;
 }
 
+/* 类选择器的 display（如 .overlay-stage 的 flex）会覆盖 UA 的
+   [hidden]{display:none}，导致隐藏失效（2D/3D 切换时旧画布不消失、
+   加载提示常驻）。这里强制 hidden 生效。 */
+[hidden] {
+    display: none !important;
+}
+
 :root {
     /* 颜色系统 */
     --primary: #667eea;

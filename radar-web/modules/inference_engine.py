@@ -120,6 +120,34 @@ def available_commit_bytes():
     return available_memory_bytes()
 
 
+def _gate_mask(mask):
+    """可靠性门控：剔除总体积<300 且最大连通域<100 体素的幻觉标签。
+
+    这类标签是模型幻觉散点或严重碎片化预测（实测腹部病例「脑」244 体素
+    散在 10 个连通域、最大 60；「肾」212 体素散在 11 个连通域），且会在
+    体内补全阶段被放大成大片假区域，严重破坏叠加可信度。真实器官要么
+    总体积足够大，要么呈单一紧凑连通域（如门静脉 200 体素单连通域），
+    不会被误删。
+    """
+    from scipy import ndimage
+
+    mask = np.asarray(mask)
+    dropped = []
+    for lab in (int(v) for v in np.unique(mask) if v > 0):
+        vol = mask == lab
+        total = int(vol.sum())
+        if total >= 300:
+            continue
+        lbl, _n = ndimage.label(vol)
+        max_comp = int(np.bincount(lbl.ravel())[1:].max())
+        if max_comp < 100:
+            dropped.append(lab)
+    if dropped:
+        mask = mask.copy()
+        mask[np.isin(mask, dropped)] = 0
+    return mask
+
+
 def _postprocess_overlay_mask(mask, ct=None):
     """对叠加显示用的器官掩码做形态学后处理（仅改善可视化，不影响诊断）。
 
@@ -136,26 +164,7 @@ def _postprocess_overlay_mask(mask, ct=None):
     """
     from scipy import ndimage
 
-    mask = np.asarray(mask)
-    # 可靠性门控：总体积 <300 且最大 3D 连通域 <100 体素的标签整器官剔除。
-    # 这类标签是模型幻觉散点或严重碎片化预测（实测腹部病例「脑」244 体素
-    # 散在 10 个连通域、最大 60；「肾」212 体素散在 11 个连通域），且会在
-    # 体内补全阶段被放大成大片假区域，严重破坏叠加可信度。真实器官要么
-    # 总体积足够大，要么呈单一紧凑连通域（如门静脉 200 体素单连通域），
-    # 不会被误删。
-    dropped = []
-    for lab in (int(v) for v in np.unique(mask) if v > 0):
-        vol = mask == lab
-        total = int(vol.sum())
-        if total >= 300:
-            continue
-        lbl, _n = ndimage.label(vol)
-        max_comp = int(np.bincount(lbl.ravel())[1:].max())
-        if max_comp < 100:
-            dropped.append(lab)
-    if dropped:
-        mask = mask.copy()
-        mask[np.isin(mask, dropped)] = 0
+    mask = _gate_mask(np.asarray(mask))
 
     labels = [int(v) for v in np.unique(mask) if v > 0]
     if not labels:
@@ -539,11 +548,15 @@ class RADARInferenceEngine:
         while mask_t.dim() > 3:
             mask_t = mask_t[0]
         ct = ct_t.numpy()                                # (D,H,W) float [0,1]
-        mask = _postprocess_overlay_mask(mask_t.numpy(), ct)  # (D,H,W) int
+        # mask_raw：仅做可靠性门控的模型原始 argmax 输出，供前端「原始分割」
+        # 显示模式查看模型真实预测边界（无闭运算/填洞/体内补全）。
+        raw = _gate_mask(mask_t.numpy())
+        mask = _postprocess_overlay_mask(raw, ct)  # (D,H,W) int
         ct_u8 = np.clip(ct * 255.0, 0, 255).astype(np.uint8)
         mask_u8 = mask.astype(np.uint8)
         os.makedirs(os.path.dirname(overlay_path), exist_ok=True)
-        np.savez_compressed(overlay_path, ct=ct_u8, mask=mask_u8)
+        np.savez_compressed(overlay_path, ct=ct_u8, mask=mask_u8,
+                            mask_raw=raw.astype(np.uint8))
         present = [int(v) for v in np.unique(mask_u8) if v > 0]
         return {
             'num_slices': int(ct_u8.shape[0]),

@@ -813,40 +813,69 @@ def _overlay_organ_stats(mask):
     return stats
 
 
-def _load_overlay(file_id):
-    """加载并缓存 overlay.npz，返回 (ct, mask, stats)。
+def _load_overlay(file_id, mode='full'):
+    """加载并缓存叠加数据，返回 (ct, mask, stats, spacing)。
 
-    ct/mask 为 (D,H,W) uint8 数组，stats 为器官标签到 Z 范围/体积的映射。
-    加载时对 mask 应用引擎的后处理（幻觉门控/去斑点/闭运算/填洞/体内
-    补全），使历史诊断导出的旧 overlay 也能呈现完整、干净的填充；
-    处理幂等，重复加载安全。
+    mode:
+      full —— 默认。模型掩码 + 引擎后处理（幻觉门控/去斑点/闭运算/填洞/
+              体内补全），历史诊断导出的旧 overlay 也能呈现完整填充；
+      raw  —— 模型原始 argmax 输出（仅可靠性门控），无补全，展示真实
+              预测边界；旧 overlay 无 mask_raw 字段时回退 full；
+      fine —— TotalSegmentator 精细分割（原始 DICOM 分辨率，诊断后后台
+              生成），不存在时返回 None。
+
+    ct/mask 为 (D,H,W) uint8 数组，stats 为器官标签到 Z 范围/体积的映射，
+    spacing 为 (z,y,x) 物理间距（mm），3D 网格生成按它套用尺度。
+    后处理幂等，重复加载安全。
     """
-    if file_id in _OVERLAY_CACHE:
-        return _OVERLAY_CACHE[file_id]
-    overlay_path = os.path.join(
-        app.config['UPLOAD_FOLDER'], 'radar_infer', file_id, 'overlay.npz'
+    cache_key = (file_id, mode)
+    if cache_key in _OVERLAY_CACHE:
+        return _OVERLAY_CACHE[cache_key]
+    infer_dir = os.path.join(
+        app.config['UPLOAD_FOLDER'], 'radar_infer', file_id
     )
-    if not os.path.exists(overlay_path):
-        return None
-    with np.load(overlay_path) as npz:
-        ct = npz['ct']
-        mask = _postprocess_overlay_mask(npz['mask'], ct)
+    if mode == 'fine':
+        overlay_path = os.path.join(infer_dir, 'fine_seg.npz')
+        if not os.path.exists(overlay_path):
+            return None
+        with np.load(overlay_path) as npz:
+            ct = npz['ct']
+            mask = npz['mask']
+            spacing = npz['spacing'].astype(np.float64).tolist()
+    else:
+        overlay_path = os.path.join(infer_dir, 'overlay.npz')
+        if not os.path.exists(overlay_path):
+            return None
+        with np.load(overlay_path) as npz:
+            ct = npz['ct']
+            if mode == 'raw' and 'mask_raw' in npz.files:
+                mask = npz['mask_raw']
+            else:
+                mask = _postprocess_overlay_mask(npz['mask'], ct)
+        spacing = [5.0, 1.0, 1.0]
     stats = _overlay_organ_stats(mask)
     # 限制缓存条目，避免多次诊断累积占用内存
     while len(_OVERLAY_CACHE) >= _OVERLAY_CACHE_MAX:
         _OVERLAY_CACHE.pop(next(iter(_OVERLAY_CACHE)))
-    _OVERLAY_CACHE[file_id] = (ct, mask, stats)
-    return ct, mask, stats
+    _OVERLAY_CACHE[cache_key] = (ct, mask, stats, spacing)
+    return ct, mask, stats, spacing
 
 
 @app.route('/api/overlay/<file_id>/meta', methods=['GET'])
 def get_overlay_meta(file_id):
-    """返回叠加数据的维度、器官标签清单、器官名与配色。"""
+    """返回叠加数据的维度、器官标签清单、器官名与配色。
+
+    支持 ?mode=full|raw|fine 选择分割来源（见 _load_overlay）；fine 不存在
+    时返回 404，前端据此隐藏对应选项。
+    """
     try:
-        loaded = _load_overlay(file_id)
+        mode = request.args.get('mode', 'full')
+        if mode not in ('full', 'raw', 'fine'):
+            mode = 'full'
+        loaded = _load_overlay(file_id, mode)
         if loaded is None:
             return jsonify({'success': False, 'message': '叠加数据不存在，请先执行AI诊断'}), 404
-        ct, mask, stats = loaded
+        ct, mask, stats, spacing = loaded
         organs = get_organ_names()
         present = sorted({int(v) for v in np.unique(mask) if v > 0})
         palette = _overlay_palette(len(organs) if organs else 36)
@@ -861,11 +890,16 @@ def get_overlay_meta(file_id):
             }
             for oid in present
         ]
+        infer_dir = os.path.join(app.config['UPLOAD_FOLDER'], 'radar_infer', file_id)
         return jsonify({
             'success': True,
+            'mode': mode,
             'num_slices': int(ct.shape[0]),
             'height': int(ct.shape[1]),
             'width': int(ct.shape[2]),
+            'spacing': spacing,
+            'has_raw': os.path.exists(os.path.join(infer_dir, 'overlay.npz')),
+            'has_fine': os.path.exists(os.path.join(infer_dir, 'fine_seg.npz')),
             'best_slice': int(np.argmax((mask > 0).sum(axis=(1, 2)))),
             'organ_legend': organ_legend,
         })
@@ -875,12 +909,18 @@ def get_overlay_meta(file_id):
 
 @app.route('/api/overlay/<file_id>/slice/<int:slice_idx>', methods=['GET'])
 def get_overlay_slice(file_id, slice_idx):
-    """返回单张切片的 CT 灰度（PNG）与器官标签（原始字节 base64）。"""
+    """返回单张切片的 CT 灰度（PNG）与器官标签（原始字节 base64）。
+
+    支持 ?mode=full|raw|fine 与 meta 一致的分割来源选择。
+    """
     try:
-        loaded = _load_overlay(file_id)
+        mode = request.args.get('mode', 'full')
+        if mode not in ('full', 'raw', 'fine'):
+            mode = 'full'
+        loaded = _load_overlay(file_id, mode)
         if loaded is None:
             return jsonify({'success': False, 'message': '叠加数据不存在，请先执行AI诊断'}), 404
-        ct, mask, _stats = loaded
+        ct, mask, _stats, _spacing = loaded
         if slice_idx < 0 or slice_idx >= ct.shape[0]:
             return jsonify({'success': False, 'message': '切片索引越界'}), 400
 
@@ -909,35 +949,68 @@ def get_overlay_slice(file_id, slice_idx):
 def overlay_mesh(file_id):
     """返回各器官的 3D 表面网格（marching cubes），供前端 three.js 重建。
 
-    网格在模型空间（间距 z=5mm, y=1mm, x=1mm）生成，降采样 3 倍控制体积，
-    响应 gzip 压缩并缓存；顶点列序为 (z, y, x)，前端映射渲染坐标时套用
-    物理间距。
+    支持 ?mode=full|raw|fine 选择分割来源（见 _load_overlay）：fine 为
+    TotalSegmentator 原始分辨率精细分割，3D 表面最光滑。网格按数据物理
+    间距（spacing，z/y/x mm）生成。为消除二值掩码直接 marching cubes 的
+    阶梯状块面：先在全分辨率对器官体积场做高斯平滑（σ=1.5 体素），再降
+    采样 2 倍提取等值面（实测粗糙度 14.1°→7.3°）。另从上传影像的 CT 灰度
+    提取平滑的体表轮廓（id=0）作为半透明解剖背景，让 3D 视图与原始 DICOM
+    影像对应。响应 gzip 压缩并缓存；顶点列序为 (z, y, x)，前端映射渲染
+    坐标时套用物理间距。
     """
     try:
-        payload = _MESH_CACHE.get(file_id)
+        mode = request.args.get('mode', 'full')
+        if mode not in ('full', 'raw', 'fine'):
+            mode = 'full'
+        cache_key = (file_id, mode)
+        payload = _MESH_CACHE.get(cache_key)
         if payload is None:
-            loaded = _load_overlay(file_id)
+            loaded = _load_overlay(file_id, mode)
             if loaded is None:
                 return jsonify({'success': False, 'message': '叠加数据不存在，请先执行AI诊断'}), 404
-            _ct, mask, stats = loaded
+            ct, mask, stats, spacing = loaded
             organs = get_organ_names()
             palette = _overlay_palette(len(organs) if organs else 36)
             from skimage import measure
+            from scipy import ndimage
             import gzip
             import json as _json
 
-            down = 3
-            small = mask[::down, ::down, ::down]
+            down = 2
+            sigma = 1.5
             meshes = []
+
+            def _extract(vol_full):
+                """全分辨率高斯平滑 → 降采样 → marching cubes，返回 (verts, faces)。"""
+                smooth = ndimage.gaussian_filter(vol_full.astype(np.float32), sigma,
+                                                 mode='constant')
+                small = ndimage.zoom(smooth, 1.0 / down, order=1)
+                verts, faces, _n, _v = measure.marching_cubes(small, level=0.5)
+                return verts * down, faces
+
+            # 体表轮廓：CT 灰度阈值化 + 填洞 + 平滑，作为解剖背景（id=0）
+            try:
+                body = (ct > 15).astype(np.float32)
+                body = ndimage.binary_fill_holes(body).astype(np.float32)
+                verts, faces = _extract(body)
+                meshes.append({
+                    'id': 0,
+                    'name': '体表轮廓',
+                    'color': [176, 190, 205],
+                    'verts': [round(float(v), 1) for v in verts.ravel().tolist()],
+                    'faces': [int(f) for f in faces.ravel().tolist()],
+                })
+            except (ValueError, RuntimeError):
+                pass
+
             for lab in sorted(stats):
-                vol = (small == lab).astype(np.uint8)
+                vol = (mask == lab)
                 if vol.sum() < 5:
                     continue
                 try:
-                    verts, faces, _n, _v = measure.marching_cubes(vol, level=0.5)
+                    verts, faces = _extract(vol)
                 except (ValueError, RuntimeError):
                     continue
-                verts = verts * down
                 meshes.append({
                     'id': lab,
                     'name': organs[lab - 1] if 0 < lab <= len(organs) else f'器官{lab}',
@@ -945,12 +1018,12 @@ def overlay_mesh(file_id):
                     'verts': [round(float(v), 1) for v in verts.ravel().tolist()],
                     'faces': [int(f) for f in faces.ravel().tolist()],
                 })
-            body = _json.dumps({'success': True, 'spacing': [5.0, 1.0, 1.0], 'meshes': meshes})
+            body = _json.dumps({'success': True, 'spacing': spacing, 'meshes': meshes})
             payload = gzip.compress(body.encode('utf-8'), 6)
             with _MESH_CACHE_LOCK:
                 while len(_MESH_CACHE) >= 4:
                     _MESH_CACHE.pop(next(iter(_MESH_CACHE)))
-                _MESH_CACHE[file_id] = payload
+                _MESH_CACHE[cache_key] = payload
         resp = make_response(payload)
         resp.headers['Content-Type'] = 'application/json'
         resp.headers['Content-Encoding'] = 'gzip'
@@ -1334,6 +1407,43 @@ def find_series_uid(study_dir):
         return None
 
 
+def _spawn_fine_segmentation(file_id, dicom_dir):
+    """后台拉起 radar-ts 环境的 TotalSegmentator worker 生成精细分割。
+
+    默认关闭：CPU 推理单次需数十分钟，需设置环境变量
+    RADAR_ENABLE_FINE_SEG=1 才在诊断后自动触发。独立 conda 环境（radar-ts）
+    运行，与主推理环境隔离；detached 子进程不阻塞诊断返回。用
+    fine_seg.running 标记防重复拉起，日志写入 infer 目录。
+    """
+    if os.environ.get('RADAR_ENABLE_FINE_SEG', '0') != '1':
+        return
+    infer_dir = os.path.join(app.config['UPLOAD_FOLDER'], 'radar_infer', file_id)
+    out_npz = os.path.join(infer_dir, 'fine_seg.npz')
+    marker = os.path.join(infer_dir, 'fine_seg.running')
+    if os.path.exists(out_npz) or os.path.exists(marker):
+        return
+    ts_python = os.path.join(os.path.expanduser('~'), '.conda', 'envs',
+                             'radar-ts', 'python.exe')
+    worker = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                          'radar-web', 'modules', 'fine_seg_worker.py')
+    if not (os.path.exists(ts_python) and os.path.exists(worker)):
+        return
+    try:
+        with open(marker, 'w', encoding='utf-8') as fh:
+            fh.write('running')
+        log = open(os.path.join(infer_dir, 'fine_seg.log'), 'w', encoding='utf-8')
+        env = dict(os.environ, PYTHONNOUSERSITE='1')
+        creationflags = 0x00000008 | 0x08000000  # DETACHED_PROCESS | CREATE_NO_WINDOW
+        subprocess.Popen(
+            [ts_python, worker, dicom_dir, out_npz],
+            stdout=log, stderr=subprocess.STDOUT, env=env,
+            creationflags=creationflags,
+        )
+    except Exception:
+        if os.path.exists(marker):
+            os.remove(marker)
+
+
 @app.route('/api/diagnose/<file_id>', methods=['POST'])
 def diagnose(file_id):
     """
@@ -1412,7 +1522,12 @@ def diagnose(file_id):
         # 保存到session
         session['current_diagnosis'] = result
         session['current_case_id'] = case_id
-        
+
+        # 后台生成 TotalSegmentator 精细分割（仅 DICOM 序列，独立环境运行，
+        # 不阻塞诊断返回；完成后前端「分割来源」出现精细分割选项）。
+        if file_type == 'dicom-series':
+            _spawn_fine_segmentation(file_id, filepath)
+
         return jsonify({
             'success': True,
             'result': result,
@@ -1584,7 +1699,7 @@ def _build_report_evidence(file_id, diagnosis_result, limit=4):
         loaded = _load_overlay(file_id)
         if loaded is None:
             return []
-        ct, mask, stats = loaded
+        ct, mask, stats, _spacing = loaded
         organ_names = {i + 1: n for i, n in enumerate(get_organ_names() or [])}
         palette = _overlay_palette(len(organ_names) or 36)
         diagnoses = diagnosis_result.get('diagnoses') or []

@@ -82,6 +82,26 @@ cd ..
   > Windows 注意：Chrome 受 260 字符路径限制，DICOM 文件夹路径过长会上传失败，
   > 请把数据放到短路径（如 `D:\dcm\`）再选择上传。
 
+## 5.5 可选：精细分割（TotalSegmentator）
+
+2D 叠加与 3D 重建默认使用 RADAR 模型自带的分割掩码（前端「分割来源」可切
+「模型原始输出」查看未补全的原始边界）。若想要更精细的器官边界（原始
+DICOM 分辨率），可安装独立的 TotalSegmentator 环境。**注意：CPU 推理单次
+需数十分钟，默认关闭**；设置 `RADAR_ENABLE_FINE_SEG=1` 后，诊断完成才会
+后台自动跑精细分割，完成后前端「分割来源」出现「精细分割」选项。不装也
+完全不影响诊断与默认显示。
+
+```powershell
+conda create -n radar-ts python=3.10 -y
+$env:PYTHONNOUSERSITE='1'                       # 隔离用户级 site-packages
+& "$env:USERPROFILE\.conda\envs\radar-ts\python.exe" -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+& "$env:USERPROFILE\.conda\envs\radar-ts\python.exe" -m pip install TotalSegmentator
+```
+
+> 若 `TotalSegmentator` 安装时 dipy 编译失败，先
+> `pip download dipy==1.9.0 --no-deps -d wheels` 再 `pip install wheels\dipy-*.whl`。
+> 首次运行会自动下载 TS 权重（约 200MB）。
+
 ## 6. 启动
 
 Windows（推荐）：

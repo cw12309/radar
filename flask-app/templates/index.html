@@ -289,6 +289,15 @@
                             </div>
 
                             <div class="overlay-control">
+                                <label for="overlaySegSource">分割来源</label>
+                                <select id="overlaySegSource">
+                                    <option value="full">完整分割（后处理）</option>
+                                    <option value="raw">模型原始输出</option>
+                                    <option value="fine" hidden>精细分割（TotalSegmentator）</option>
+                                </select>
+                            </div>
+
+                            <div class="overlay-control">
                                 <label for="overlayMode">渲染模式</label>
                                 <select id="overlayMode">
                                     <option value="fill">填充叠加</option>
