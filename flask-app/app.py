@@ -157,7 +157,32 @@ def run_inference_subprocess(nifti_path, overlay_path=None, timeout=1800):
         global _ORGAN_NAMES
         _ORGAN_NAMES = list(organs)
     if not payload.get('success'):
-        return None, organs, payload.get('error', '推理失败')
+        err = payload.get('error', '推理失败')
+        # GPU 内存守卫拦截 → 自动降级 CPU 推理重试一次。本机提交余量常年在
+        # 10~13 GB 晃动、贴着 GPU 守卫阈值（~10.9 GB），多次出现差 0.1 GB 被拦；
+        # CPU 路径阈值仅 ~6.4 GB（按物理可用内存判），慢但能出结果，避免用户
+        # 反复重试撞墙。CPU 守卫也拦时返回错误不再重试。
+        if use_gpu and '影像过大' in err and 'GPU' in err:
+            app.logger.warning('[infer] GPU 内存守卫拦截（%s），自动降级 CPU 推理重试',
+                               err[:60])
+            os.remove(result_path)
+            cmd_cpu = [c for c in cmd if c != '--use-gpu']
+            proc = subprocess.run(
+                cmd_cpu, capture_output=True, text=True, encoding='utf-8',
+                errors='replace', timeout=timeout, cwd=current_dir)
+            if proc.stderr:
+                for line in proc.stderr.strip().splitlines():
+                    app.logger.info('[infer-worker-cpu] %s', line)
+            if os.path.exists(result_path):
+                with open(result_path, encoding='utf-8') as f:
+                    payload = json.load(f)
+                organs = payload.get('organs') or organs
+                if organs:
+                    _ORGAN_NAMES = list(organs)
+                if payload.get('success'):
+                    return payload.get('result'), organs, None
+                err = payload.get('error', err)
+        return None, organs, err
     return payload.get('result'), organs, None
 
 # 允许的文件扩展名
@@ -950,13 +975,15 @@ def overlay_mesh(file_id):
     """返回各器官的 3D 表面网格（marching cubes），供前端 three.js 重建。
 
     支持 ?mode=full|raw|fine 选择分割来源（见 _load_overlay）：fine 为
-    TotalSegmentator 原始分辨率精细分割，3D 表面最光滑。网格按数据物理
-    间距（spacing，z/y/x mm）生成。为消除二值掩码直接 marching cubes 的
-    阶梯状块面：先在全分辨率对器官体积场做高斯平滑（σ=1.5 体素），再降
-    采样 2 倍提取等值面（实测粗糙度 14.1°→7.3°）。另从上传影像的 CT 灰度
-    提取平滑的体表轮廓（id=0）作为半透明解剖背景，让 3D 视图与原始 DICOM
-    影像对应。响应 gzip 压缩并缓存；顶点列序为 (z, y, x)，前端映射渲染
-    坐标时套用物理间距。
+    TotalSegmentator 原始分辨率精细分割，3D 表面最光滑。
+
+    提取管线（实验见 .dbg/exp_mesh_quality2.py）：overlay 的 spacing 各向异性
+    （如 [5,1,1]mm），在体素空间做高斯平滑会让 z 向等效 σ 达 7.5mm、表面呈阶梯
+    块面。故先重采样到 2mm 各向同性物理网格，用物理 σ=2mm 平滑后提取等值面，
+    再在物理 mm 空间做 Taubin 平滑（λ 收缩/μ 膨胀交替，去噪且不缩体积），
+    顶点换算回原始体素坐标返回（前端仍按 spacing 映射渲染坐标）。实测粗糙度
+    8.7°→5.5°、网格-体素体积误差 12.6%→7.6%。另从上传影像的 CT 灰度提取平滑
+    的体表轮廓（id=0）作为半透明解剖背景。响应 gzip 压缩并缓存。
     """
     try:
         mode = request.args.get('mode', 'full')
@@ -976,17 +1003,39 @@ def overlay_mesh(file_id):
             import gzip
             import json as _json
 
-            down = 2
-            sigma = 1.5
             meshes = []
+            iso = 2.0           # 各向同性重采样步长（mm）
+            sigma_mm = 2.0      # 物理空间平滑 σ（mm）
+            taubin_iters = 10   # Taubin 平滑迭代数（λ/μ 各算一步）
+            sp = np.asarray(spacing, dtype=np.float64)
+
+            def _taubin_mm(verts_mm, faces):
+                """物理 mm 空间 Taubin 平滑：λ 收缩 + μ 膨胀交替，去噪且不缩体积。"""
+                e = np.vstack([faces[:, [0, 1]], faces[:, [1, 2]], faces[:, [2, 0]]])
+                e = np.vstack([e, e[:, ::-1]])
+                n = len(verts_mm)
+                deg = np.bincount(e[:, 0], minlength=n).astype(np.float32)
+                deg[deg == 0] = 1.0
+                inv = 1.0 / deg[:, None]
+                v = verts_mm.copy()
+                for _ in range(taubin_iters):
+                    for k in (0.5, -0.53):
+                        acc = np.zeros_like(v)
+                        np.add.at(acc, e[:, 0], v[e[:, 1]])
+                        v = v + k * (acc * inv - v)
+                return v
 
             def _extract(vol_full):
-                """全分辨率高斯平滑 → 降采样 → marching cubes，返回 (verts, faces)。"""
-                smooth = ndimage.gaussian_filter(vol_full.astype(np.float32), sigma,
+                """各向同性重采样 → 物理 σ 平滑 → marching cubes → Taubin。
+
+                返回 (verts, faces)，verts 为原始体素坐标（前端按 spacing 映射）。
+                """
+                small = ndimage.zoom(vol_full.astype(np.float32), sp / iso, order=1)
+                smooth = ndimage.gaussian_filter(small, sigma_mm / iso,
                                                  mode='constant')
-                small = ndimage.zoom(smooth, 1.0 / down, order=1)
-                verts, faces, _n, _v = measure.marching_cubes(small, level=0.5)
-                return verts * down, faces
+                verts, faces, _n, _v = measure.marching_cubes(smooth, level=0.5)
+                verts_mm = _taubin_mm(verts * iso, faces)
+                return verts_mm / sp, faces
 
             # 体表轮廓：CT 灰度阈值化 + 填洞 + 平滑，作为解剖背景（id=0）
             try:
@@ -1444,6 +1493,68 @@ def _spawn_fine_segmentation(file_id, dicom_dir):
             os.remove(marker)
 
 
+# 推理串行化：Flask threaded=True 下并发诊断会同时拉起多个推理子进程，
+# CPU/内存互相抢占导致单次推理耗时翻倍，前端/代理等待超时（504）。
+# 诊断本身是重计算任务，串行执行更符合预期。
+_DIAGNOSE_LOCK = threading.Lock()
+
+
+def _assess_input_quality(image_data, geometry, file_type, filepath, overlay_path=None):
+    """评估输入影像是否满足 RADAR 的适用条件，返回警告列表。
+
+    RADAR 在「增强、胸腹大范围 CT」上训练。两类输入会系统性产生高置信度
+    假阳性（实测：局灶裁剪序列报肺转移瘤/胃溃疡，平扫序列报胰腺癌）：
+      1) 扫描范围过短：Z 向覆盖远小于模型视野，重采样后大部分体为填充，
+         模型把填充边界与局部解剖误读为病变；
+      2) 平扫（无对比剂）：实质/血管强化模式与训练分布不符。
+    警告不阻断诊断，仅随结果返回并由前端提示。推理后调用：平扫判定依赖
+    overlay 的肝掩码平均 HU（增强门脉期肝实质约 90-110 HU，平扫约 45-60）。
+    """
+    warnings = []
+    geometry = geometry or {}
+    slice_spacing = geometry.get('slice_spacing') or 1.0
+    slice_count = geometry.get('slice_count') or int(np.asarray(image_data).shape[0])
+    z_extent = float(slice_spacing) * max(int(slice_count) - 1, 0)
+    if 0 < z_extent < 250.0:
+        warnings.append(
+            f'扫描范围过短：Z 向覆盖约 {z_extent:.0f} mm（{slice_count} 层）。'
+            'RADAR 训练于胸腹大范围 CT，局灶/裁剪序列超出其适用分布，'
+            '诊断结果假阳性风险极高，仅供演示参考。'
+        )
+
+    if file_type in ('dicom-series', 'dicom'):
+        agent = ''
+        try:
+            if os.path.isdir(filepath):
+                files = sorted(str(p) for p in Path(filepath).iterdir() if p.is_file())
+            else:
+                files = [filepath]
+            if files:
+                ds = pydicom.dcmread(files[len(files) // 2], stop_before_pixels=True)
+                agent = str(getattr(ds, 'ContrastBolusAgent', '') or '').strip()
+                # 部分设备把缺失值写成字面量 "None"/"N/A"
+                if agent.lower() in ('none', 'n/a', 'na'):
+                    agent = ''
+        except Exception:
+            agent = ''
+        if not agent and overlay_path and os.path.exists(overlay_path):
+            # 头字段缺失/为空时用肝区平均 HU 判定：overlay 的 ct 为
+            # HU[-300,400] 归一化 uint8，肝掩码标签 id=21（器官表第 21 位）。
+            try:
+                ov = np.load(overlay_path)
+                ct = ov['ct'].astype(np.float32) / 255.0 * 700.0 - 300.0
+                liver = ov['mask'] == 21
+                if int(liver.sum()) > 500 and float(ct[liver].mean()) < 70.0:
+                    warnings.append(
+                        f'疑似平扫（无对比剂）序列：肝区平均 '
+                        f'{float(ct[liver].mean()):.0f} HU。RADAR 训练于增强 CT，'
+                        '平扫输入的强化特征缺失，诊断置信度不可靠。'
+                    )
+            except Exception:
+                pass
+    return warnings
+
+
 @app.route('/api/diagnose/<file_id>', methods=['POST'])
 def diagnose(file_id):
     """
@@ -1469,10 +1580,18 @@ def diagnose(file_id):
         )
         # 在独立子进程执行推理：主进程不常驻模型权重，避免常驻内存与推理
         # 峰值叠加超出系统提交余量（实测独立进程可成功、常驻进程被守卫拦截）。
-        result, _organs, err = run_inference_subprocess(nifti_path, overlay_path)
+        # 串行化：并发推理子进程互相抢占 CPU/内存，单次耗时翻倍触发 504。
+        with _DIAGNOSE_LOCK:
+            result, _organs, err = run_inference_subprocess(nifti_path, overlay_path)
         if err:
             status = 503 if '过大' in err or '内存' in err or '显存' in err else 500
             return jsonify({'success': False, 'message': f'诊断失败: {err}'}), status
+
+        # 输入适用性评估：扫描范围/对比剂不满足训练分布时随结果给出警告。
+        # 平扫判定依赖推理产出的 overlay 肝掩码，故在推理后执行。
+        input_warnings = _assess_input_quality(
+            image_data, geometry, file_type, filepath, overlay_path
+        )
 
         settings = read_settings()
         threshold = settings['confidence_threshold']
@@ -1506,6 +1625,7 @@ def diagnose(file_id):
         except Exception:
             metadata = {}
         result['metadata'] = metadata
+        result['warnings'] = input_warnings
 
         # 患者ID：优先用 DICOM 真实 PatientID，缺失时回退到时间戳生成的占位ID
         patient_id = metadata.get('patient_id') or f"P{datetime.now().strftime('%Y%m%d%H%M%S')}"
@@ -1624,8 +1744,10 @@ def _heat_color(t):
 
 def _render_evidence_slice(ct, mask, stats, organ_names, palette,
                            organ_conf, slice_idx, mode):
-    """把单张切片渲染成 PNG 字节（分割填充 或 注意力热力）。
+    """把单张切片渲染成 PNG 字节。
 
+    mode='circle': 纯 CT 灰度 + 红圈标出受累器官病灶（最大连通域外接圆），
+                   不做任何填充，保留原始影像纹理供医师复核
     mode='seg'  : 器官按固定配色半透明填充（轮廓加深）
     mode='heat' : 仅受累器官，按诊断置信度走热力色，边缘用距离变换羽化
     """
@@ -1641,6 +1763,29 @@ def _render_evidence_slice(ct, mask, stats, organ_names, palette,
     if not labels:
         buf = io.BytesIO()
         PILImage.fromarray(rgb.astype(np.uint8), mode='RGB').save(buf, format='PNG')
+        return buf.getvalue()
+
+    if mode == 'circle':
+        from PIL import ImageDraw
+        img = PILImage.fromarray(rgb.astype(np.uint8), mode='RGB')
+        draw = ImageDraw.Draw(img)
+        for lab in labels:
+            vol = seg == lab
+            if not vol.any():
+                continue
+            comps, n = ndimage.label(vol)
+            if not n:
+                continue
+            sizes = ndimage.sum(vol, comps, index=list(range(1, n + 1)))
+            big = int(np.argmax(sizes)) + 1
+            ys, xs = np.where(comps == big)
+            cy, cx = float(ys.mean()), float(xs.mean())
+            # 外接圆半径取包围盒半长边并留 25% 余量，保证圈住整个病灶区
+            r = max(ys.max() - ys.min(), xs.max() - xs.min()) / 2.0 * 1.25 + 4
+            draw.ellipse([cx - r, cy - r, cx + r, cy + r],
+                         outline=(255, 40, 40), width=3)
+        buf = io.BytesIO()
+        img.save(buf, format='PNG')
         return buf.getvalue()
 
     if mode == 'heat':
@@ -1688,10 +1833,11 @@ def _render_evidence_slice(ct, mask, stats, organ_names, palette,
 
 
 def _build_report_evidence(file_id, diagnosis_result, limit=4):
-    """生成 PDF「影像证据」截图：受累器官的分割叠加 + 注意力热力对照。
+    """生成 PDF「影像证据」截图：纯 CT 灰度 + 红圈标出受累器官病灶。
 
     每张图选在对应器官体素最多的层面（证据最充分），标题带器官名、发现、
-    置信度与层号，医师可据此在原始序列上定位复核。渲染失败不影响报告生成。
+    置信度与层号，医师可据此在原始序列上定位复核。不做任何颜色填充，
+    保留原始影像纹理。渲染失败不影响报告生成。
     """
     if not file_id:
         return []
@@ -1729,24 +1875,23 @@ def _build_report_evidence(file_id, diagnosis_result, limit=4):
             z = int(zs[np.argmax((mask == lab).sum(axis=(1, 2))[zs])])
             d = best_diag.get(organ, {})
             items.append((organ, lab, z, d, s.get('volume', 0)))
-            if len(items) >= max(1, limit // 2):
+            if len(items) >= max(1, limit):
                 break
 
         evidence = []
         for organ, lab, z, d, volume in items:
             title = (f"{organ} · {d.get('finding', '异常发现')}"
                      f"　置信度 {float(d.get('confidence') or 0):.1%}"
-                     f"　第 {z + 1}/{ct.shape[0]} 层")
-            for mode, tag in (('seg', '分割叠加'), ('heat', '注意力热力')):
-                try:
-                    evidence.append({
-                        'title': f'{title}（{tag}）',
-                        'png': _render_evidence_slice(
-                            ct, mask, {lab: stats[lab]}, organ_names, palette,
-                            organ_conf, z, mode),
-                    })
-                except Exception as exc:  # noqa: BLE001 - 单图失败不影响报告
-                    app.logger.warning('[report] 证据图渲染失败 %s/%s: %s', organ, tag, exc)
+                     f"　第 {z + 1}/{ct.shape[0]} 层（红圈为病灶定位）")
+            try:
+                evidence.append({
+                    'title': title,
+                    'png': _render_evidence_slice(
+                        ct, mask, {lab: stats[lab]}, organ_names, palette,
+                        organ_conf, z, 'circle'),
+                })
+            except Exception as exc:  # noqa: BLE001 - 单图失败不影响报告
+                app.logger.warning('[report] 证据图渲染失败 %s: %s', organ, exc)
         return evidence[:limit]
     except Exception as exc:  # noqa: BLE001
         app.logger.warning('[report] 生成影像证据失败: %s', exc)

@@ -395,7 +395,8 @@ class RADARInferenceEngine:
         is_cpu = self.device.type == 'cpu'
         transient = (self.CPU_WINDOW_TRANSIENT_BYTES if is_cpu
                      else self.GPU_WINDOW_TRANSIENT_BYTES)
-        mask_bytes = 37 * int(np.prod(image_size)) * 4
+        # 拼接掩码为 fp16 累加器（见下 full_mask 分配处），每通道 2 字节
+        mask_bytes = 37 * int(np.prod(image_size)) * 2
         est_peak = mask_bytes + transient
         if is_cpu:
             # CPU 路径的前向激活也落在系统内存，峰值以工作集(物理内存)口径标定，
@@ -440,7 +441,8 @@ class RADARInferenceEngine:
         # 触发 WDDM 换页后单窗前向从 2s 劣化到 45s，并最终 CUDA OOM。
         # 实测改放系统内存后：6.91s/窗、显存峰值 6385 MiB，
         # 相比 CPU 基线 46.17s/窗 提速 6.7x；每窗 PCIe 回传仅约 0.8s。
-        full_mask = torch.zeros((1, 37) + tuple(image_size), device='cpu')
+        full_mask = torch.zeros((1, 37) + tuple(image_size), device='cpu',
+                                dtype=torch.float16)
         # 重叠计数在37个通道上完全一致，使用单通道以显著降低内存占用，结果等价
         count_map = torch.zeros((1, 1) + tuple(image_size), device='cpu')
 
@@ -465,7 +467,10 @@ class RADARInferenceEngine:
             # full_mask/count_map 常驻系统内存，GPU 结果需先回传再累加，
             # 否则跨设备就地相加报错。回传后立即释放该窗的显存张量，
             # 避免显存碎片累积（reserved 峰值实测可达 9492 MiB）。
-            interpolated_seg_prob = interpolated_seg_prob.to('cpu', non_blocking=False)
+            # 回传块转 fp16：full_mask 为 fp16 累加器（内存减半），概率值域
+            # [0,1]、重叠累加上限约 8，fp16 精度（~1e-3）对 argmax 排序足够。
+            interpolated_seg_prob = interpolated_seg_prob.to(
+                'cpu', non_blocking=False).half()
             for ii, slice_idx in enumerate(slice_range):
                 full_slice = tuple(unravel_slice[ii])
                 full_mask[full_slice] += interpolated_seg_prob[ii]
@@ -477,7 +482,8 @@ class RADARInferenceEngine:
         count_map = torch.clamp(count_map, min=1)
         # 就地除法，避免 (full_mask / count_map) 额外分配一个同尺寸37通道张量，
         # 否则峰值内存翻倍，是CPU推理OOM崩溃的直接诱因。
-        full_mask /= count_map
+        # count_map 为小整数(1~8)，fp16 精确表示；转 half 以匹配 fp16 累加器。
+        full_mask /= count_map.half()
         stitched_mask = full_mask.argmax(1).unsqueeze(0)
         del full_mask, count_map
 

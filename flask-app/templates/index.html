@@ -176,6 +176,9 @@
                     <div class="info-grid" id="resultMetaGrid"></div>
                 </div>
 
+                <!-- 输入适用性警告（扫描范围/对比剂不满足训练分布时显示） -->
+                <div class="input-warnings card" id="inputWarnings" hidden></div>
+
                 <!-- 总体印象横幅 -->
                 <div class="impression-banner card" id="impressionBanner">
                     <div class="impression-risk" id="impressionRisk">
@@ -291,8 +294,8 @@
                             <div class="overlay-control">
                                 <label for="overlaySegSource">分割来源</label>
                                 <select id="overlaySegSource">
+                                    <option value="raw" selected>模型原始输出</option>
                                     <option value="full">完整分割（后处理）</option>
-                                    <option value="raw">模型原始输出</option>
                                     <option value="fine" hidden>精细分割（TotalSegmentator）</option>
                                 </select>
                             </div>

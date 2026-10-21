@@ -558,7 +558,11 @@ async function performDiagnosis() {
             displayDiagnosisResult(data.result);
             setWorkflowStep('workflowDiagnosisStep');
             setWorkflowStep('workflowReportStep');
-            showToast('诊断完成，结果已生成', 'success');
+            if ((data.result.warnings || []).length) {
+                showToast('诊断完成，但输入影像不满足模型适用条件，结果仅供参考', 'warning');
+            } else {
+                showToast('诊断完成，结果已生成', 'success');
+            }
         } else {
             showToast(data.message || '诊断失败', 'error');
         }
@@ -625,6 +629,20 @@ function displayDiagnosisResult(result) {
         grid: 'resultMetaGrid',
         source: 'resultMetaSource',
     });
+
+    // ===== 输入适用性警告（扫描范围/对比剂不满足训练分布）=====
+    const warnBox = document.getElementById('inputWarnings');
+    const warnings = result.warnings || [];
+    if (warnBox) {
+        if (warnings.length) {
+            warnBox.innerHTML = '<div class="iw-title">输入影像不满足模型适用条件，以下结果假阳性风险高</div>'
+                + '<ul>' + warnings.map(w => `<li>${w}</li>`).join('') + '</ul>';
+            warnBox.hidden = false;
+        } else {
+            warnBox.innerHTML = '';
+            warnBox.hidden = true;
+        }
+    }
 
     // ===== 总体印象横幅 =====
     const overall = overallSeverity(diagnoses);
@@ -813,7 +831,7 @@ const OverlayState = {
     // 2D 渲染模式：fill 填充 / contour 轮廓 / heat 注意力热力 / ct 隐藏叠加
     renderMode: 'fill',
     // 分割来源：full 后处理完整分割 / raw 模型原始输出 / fine TotalSegmentator
-    segSource: 'full',
+    segSource: 'raw',
     // 3D 场景当前网格对应的分割来源（切换来源时需重建）
     scene3dSource: null,
     // 视图模式：2d 切片 / 3d 重建
