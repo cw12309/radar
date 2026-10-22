@@ -119,7 +119,11 @@ def center_crop(image, mask, crop_size):
     if z_end - z_start < crop_d:
         z_start = max(0, z_end - crop_d)
     
-    return image[..., z_start:z_end, y_start:y_end, x_start:x_end], mask[..., z_start:z_end, y_start:y_end, x_start:x_end]
+    # 第三返回值为裁剪块在全体积中的 (z,y,x) 偏移：第二轮补推理的注意力
+    # 散回全体积时需要它定位
+    return (image[..., z_start:z_end, y_start:y_end, x_start:x_end],
+            mask[..., z_start:z_end, y_start:y_end, x_start:x_end],
+            (z_start, y_start, x_start))
 
 class DataFolder(Dataset):
     def __init__(self, img_dir):
@@ -312,6 +316,8 @@ class RADAR(nn.Module):
 
         margin = 2
         masks = seg
+        # 每窗每器官的空间注意力（散回三尺度 token 网格），供报告病灶定位
+        window_attn = []
         
         for i, (embed1, embed2, embed3, mask) in enumerate(zip(image_embeds1, image_embeds2, image_embeds3, masks)):
             boundaries = []
@@ -366,8 +372,23 @@ class RADAR(nn.Module):
 
                 key = value = torch.cat([key1, key2, key3], dim=1)
                 
-                updated_query_token, _ = self.attention(query, key, value)
+                updated_query_token, attn_w = self.attention(query, key, value)
                 updated_query_token = updated_query_token.squeeze(0)
+
+                # 注意力权重 (1,1,K) 散回三尺度 token 网格（K=len(key) 的拼接
+                # 顺序即 key1|key2|key3），记录该器官在窗内的空间关注分布
+                attn_w = attn_w.squeeze(0).squeeze(0)
+                n1, n2 = int(tokens1.sum()), int(tokens2.sum())
+                attn_entry = {
+                    'organ_id': int(organ_id.item()),
+                    'a1': attn_w[:n1].cpu().tolist(),
+                    'a2': attn_w[n1:n1 + n2].cpu().tolist(),
+                    'a3': attn_w[n1 + n2:].cpu().tolist(),
+                    'g1': tokens1.cpu().tolist(),
+                    'g2': tokens2.cpu().tolist(),
+                    'g3': tokens3.cpu().tolist(),
+                }
+                window_attn.append(attn_entry)
 
                 image_feat = F.normalize(self.vision_projs[organ_id](updated_query_token), dim=-1)
                 
@@ -387,7 +408,7 @@ class RADAR(nn.Module):
                     probs = logits.softmax(-1)
                     organ_logits[item].append(probs.cpu().tolist())
     
-        return organ_logits, seg_probs
+        return organ_logits, seg_probs, window_attn
 
 @torch.inference_mode()
 def evaluate(pad_func, model, img_dir, save_dir, save_tag):
@@ -457,7 +478,7 @@ def evaluate(pad_func, model, img_dir, save_dir, save_tag):
             
             window_patches = torch.cat([image[win_slice] for win_slice in unravel_slice]).cuda()
 
-            organ_logits, pred_window_seg_prob = model.forward_test_win(
+            organ_logits, pred_window_seg_prob, _attn = model.forward_test_win(
                 window_patches, 
                 None,
                 organ_logits,
@@ -515,7 +536,7 @@ def evaluate(pad_func, model, img_dir, save_dir, save_tag):
                 organ_name = k.split('_')[0]
                 organ_id = datafolder.organs.index(organ_name)
 
-                window_patch, window_mask = center_crop(
+                window_patch, window_mask, _crop_off = center_crop(
                     image,
                     torch.eq(stitched_mask, organ_id + 1),
                     crop_size=roi_size
@@ -526,7 +547,7 @@ def evaluate(pad_func, model, img_dir, save_dir, save_tag):
                 pad_data = pad_func({'image': window_patch[0], 'label': window_mask[0]})
                 window_patch, window_mask = pad_data['image'], pad_data['label']
 
-                organ_logits, _ = model.forward_test_win(
+                organ_logits, _, _attn = model.forward_test_win(
                     window_patch[None], 
                     None,
                     organ_logits,

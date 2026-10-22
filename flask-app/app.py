@@ -1742,12 +1742,33 @@ def _heat_color(t):
     return stops[-1][1]
 
 
+def _load_attention(file_id):
+    """加载 overlay.npz 内的器官空间注意力 (36,D,H,W) uint8，无则 None。
+
+    注意力为模型 MultiheadAttention 的器官级空间权重散回全体积（每器官
+    归一化 0-255），报告红圈据此把病灶约束到器官内模型高关注区。
+    """
+    path = os.path.join(app.config['UPLOAD_FOLDER'], 'radar_infer', file_id,
+                        'overlay.npz')
+    if not os.path.exists(path):
+        return None
+    try:
+        with np.load(path) as npz:
+            if 'attn' not in npz.files:
+                return None
+            return npz['attn']
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def _render_evidence_slice(ct, mask, stats, organ_names, palette,
-                           organ_conf, slice_idx, mode):
+                           organ_conf, slice_idx, mode, attn=None):
     """把单张切片渲染成 PNG 字节。
 
-    mode='circle': 纯 CT 灰度 + 红圈标出受累器官病灶（最大连通域外接圆），
-                   不做任何填充，保留原始影像纹理供医师复核
+    mode='circle': 纯 CT 灰度 + 红圈标出受累器官病灶，不做任何填充，保留
+                   原始影像纹理供医师复核。定位优先级：模型空间注意力高
+                   关注区（attn，器官内前 50% 分位）∩ 原始分割 → 最大连通
+                   域外接圆；无 attn 时退化为原始分割最大连通域外接圆
     mode='seg'  : 器官按固定配色半透明填充（轮廓加深）
     mode='heat' : 仅受累器官，按诊断置信度走热力色，边缘用距离变换羽化
     """
@@ -1773,10 +1794,21 @@ def _render_evidence_slice(ct, mask, stats, organ_names, palette,
             vol = seg == lab
             if not vol.any():
                 continue
-            comps, n = ndimage.label(vol)
+            region = vol
+            # 注意力高关注区（器官内前 50% 分位）∩ 原始分割：把圈约束到
+            # 模型做该诊断时真正关注的器官子区，避免大器官整器官画圈
+            if attn is not None and lab - 1 < attn.shape[0]:
+                a = attn[lab - 1][slice_idx]
+                pos = a[vol]
+                if pos.size and pos.max() > 0:
+                    thr = np.quantile(pos[pos > 0], 0.5)
+                    hi = (a >= thr) & (a > 0) & vol
+                    if hi.sum() >= 20:
+                        region = hi
+            comps, n = ndimage.label(region)
             if not n:
                 continue
-            sizes = ndimage.sum(vol, comps, index=list(range(1, n + 1)))
+            sizes = ndimage.sum(region, comps, index=list(range(1, n + 1)))
             big = int(np.argmax(sizes)) + 1
             ys, xs = np.where(comps == big)
             cy, cx = float(ys.mean()), float(xs.mean())
@@ -1832,12 +1864,32 @@ def _render_evidence_slice(ct, mask, stats, organ_names, palette,
     return buf.getvalue()
 
 
-def _build_report_evidence(file_id, diagnosis_result, limit=4):
-    """生成 PDF「影像证据」截图：纯 CT 灰度 + 红圈标出受累器官病灶。
+def _compose_evidence_pair(png_seg, png_circle):
+    """左右拼接对照图：分割标记图 | 原图红圈，中间留白分隔。"""
+    from PIL import Image as PILImage
+    left = PILImage.open(io.BytesIO(png_seg)).convert('RGB')
+    right = PILImage.open(io.BytesIO(png_circle)).convert('RGB')
+    h = max(left.height, right.height)
+    gap = 8
+    canvas = PILImage.new('RGB', (left.width + gap + right.width, h),
+                          (255, 255, 255))
+    canvas.paste(left, (0, (h - left.height) // 2))
+    canvas.paste(right, (left.width + gap, (h - right.height) // 2))
+    buf = io.BytesIO()
+    canvas.save(buf, format='PNG')
+    return buf.getvalue()
 
-    每张图选在对应器官体素最多的层面（证据最充分），标题带器官名、发现、
-    置信度与层号，医师可据此在原始序列上定位复核。不做任何颜色填充，
-    保留原始影像纹理。渲染失败不影响报告生成。
+
+def _build_report_evidence(file_id, diagnosis_result, limit=4):
+    """生成 PDF「影像证据」截图：左右对照（模型原始输出分割 | 原图红圈）。
+
+    每张图选在器官内注意力总量最大的层面（证据最充分），标题带器官名、
+    发现、置信度与层号，医师可据此在原始序列上定位复核。渲染失败不影响
+    报告生成。
+
+    红圈定位基于模型原始输出（mask_raw）：后处理掩码的「体内最近邻补全」
+    会把器官标签拉成楔形区（如肾标签延伸到侧腹壁、肺标签铺满胸腔），
+    外接圆随之偏移/放大；原始输出只含模型真实预测的器官区域，圈更贴合。
     """
     if not file_id:
         return []
@@ -1846,6 +1898,10 @@ def _build_report_evidence(file_id, diagnosis_result, limit=4):
         if loaded is None:
             return []
         ct, mask, stats, _spacing = loaded
+        # 旧 overlay 无 mask_raw 时 _load_overlay 自动回退后处理掩码
+        raw_loaded = _load_overlay(file_id, mode='raw')
+        mask_loc = raw_loaded[1] if raw_loaded is not None else mask
+        attn = _load_attention(file_id)
         organ_names = {i + 1: n for i, n in enumerate(get_organ_names() or [])}
         palette = _overlay_palette(len(organ_names) or 36)
         diagnoses = diagnosis_result.get('diagnoses') or []
@@ -1869,10 +1925,24 @@ def _build_report_evidence(file_id, diagnosis_result, limit=4):
             if lab is None or lab not in stats:
                 continue
             s = stats[lab]
-            zs = np.where((mask == lab).sum(axis=(1, 2)) > 0)[0]
+            vol_lab = mask_loc == lab
+            per_z = vol_lab.sum(axis=(1, 2))
+            a_per_z = None
+            if attn is not None and lab - 1 < attn.shape[0]:
+                a_per_z = np.where(vol_lab, attn[lab - 1].astype(np.float64),
+                                   0.0).sum(axis=(1, 2))
+            if a_per_z is not None and a_per_z.max() > 0:
+                # 证据层取「器官内注意力总量」最大的层：模型关注最集中、
+                # 病灶证据最充分的层面，而非单纯器官面积最大的层
+                zs = np.where(a_per_z > 0)[0]
+                score = a_per_z
+            else:
+                # 该器官无注意力（旧 overlay 或补推理未产出）时回退体素选层
+                zs = np.where(per_z > 0)[0]
+                score = per_z
             if not len(zs):
                 continue
-            z = int(zs[np.argmax((mask == lab).sum(axis=(1, 2))[zs])])
+            z = int(zs[np.argmax(score[zs])])
             d = best_diag.get(organ, {})
             items.append((organ, lab, z, d, s.get('volume', 0)))
             if len(items) >= max(1, limit):
@@ -1882,13 +1952,20 @@ def _build_report_evidence(file_id, diagnosis_result, limit=4):
         for organ, lab, z, d, volume in items:
             title = (f"{organ} · {d.get('finding', '异常发现')}"
                      f"　置信度 {float(d.get('confidence') or 0):.1%}"
-                     f"　第 {z + 1}/{ct.shape[0]} 层（红圈为病灶定位）")
+                     f"　第 {z + 1}/{ct.shape[0]} 层"
+                     f"（左：模型原始输出分割｜右：原图红圈病灶定位）")
             try:
+                # 对照组：左=仅病灶所在器官的模型原始输出分割填充（标记
+                # 受累范围，不画无关器官），右=纯原图+红圈（可看纹理）
+                png_seg = _render_evidence_slice(
+                    ct, mask_loc, {lab: stats[lab]}, organ_names, palette,
+                    organ_conf, z, 'seg')
+                png_circle = _render_evidence_slice(
+                    ct, mask_loc, {lab: stats[lab]}, organ_names, palette,
+                    organ_conf, z, 'circle', attn=attn)
                 evidence.append({
                     'title': title,
-                    'png': _render_evidence_slice(
-                        ct, mask, {lab: stats[lab]}, organ_names, palette,
-                        organ_conf, z, 'circle'),
+                    'png': _compose_evidence_pair(png_seg, png_circle),
                 })
             except Exception as exc:  # noqa: BLE001 - 单图失败不影响报告
                 app.logger.warning('[report] 证据图渲染失败 %s: %s', organ, exc)

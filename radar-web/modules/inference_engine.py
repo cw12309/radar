@@ -445,6 +445,10 @@ class RADARInferenceEngine:
                                 dtype=torch.float16)
         # 重叠计数在37个通道上完全一致，使用单通道以显著降低内存占用，结果等价
         count_map = torch.zeros((1, 1) + tuple(image_size), device='cpu')
+        # 每窗每器官的空间注意力小数据收集（散回全体积推迟到导出阶段，
+        # 此时 full_mask 已释放，峰值不叠加）：供报告红圈把病灶约束到
+        # 器官内模型高关注区
+        attn_entries = []
 
         for slice_g in range(0, num_win, sw_batch_size):
             slice_range = range(slice_g, min(slice_g + sw_batch_size, num_win))
@@ -456,10 +460,14 @@ class RADARInferenceEngine:
                 [image[tuple(win_slice)] for win_slice in unravel_slice]
             ).to(self.device)
 
-            organ_logits, pred_window_seg_prob = self.model.forward_test_win(
+            organ_logits, pred_window_seg_prob, window_attn = self.model.forward_test_win(
                 window_patches, None, organ_logits, test_organs,
                 self.text_feat_dict, organ_feat_dict, None
             )
+            self._collect_window_attn(
+                attn_entries, window_attn,
+                tuple(int(s.start or 0) for s in slices[slice_g]),
+                window_patches.shape[2:])
 
             interpolated_seg_prob = torch.nn.functional.interpolate(
                 pred_window_seg_prob, size=window_patches.shape[2:], mode='trilinear'
@@ -496,21 +504,32 @@ class RADARInferenceEngine:
                 continue
             organ_id = self.organs.index(organ_name)
             try:
-                window_patch, window_mask = demo.center_crop(
+                window_patch, window_mask, crop_off = demo.center_crop(
                     image, torch.eq(stitched_mask, organ_id + 1), crop_size=roi_size
                 )
             except Exception:
                 continue
             if window_mask.sum() == 0:
                 continue
+            crop_shape = tuple(int(v) for v in window_patch.shape[-3:])
             window_mask = window_mask.float()
             window_mask[window_mask == 1] = organ_id + 1
             pad_data = self.pad_func({'image': window_patch[0], 'label': window_mask[0]})
             window_patch, window_mask = pad_data['image'], pad_data['label']
-            organ_logits, _ = self.model.forward_test_win(
+            organ_logits, _, window_attn = self.model.forward_test_win(
                 window_patch[None].to(self.device), None, organ_logits, test_organs,
                 self.text_feat_dict, organ_feat_dict, None, skip_organ=organ_id
             )
+            # 大器官（肺、肋骨等）的注意力只在本轮补推理产出：首轮它们在每个
+            # 滑窗都触边界、被 intact_organ_ids 排除。散回全体积时注意力网格
+            # 坐标在 pad 后窗坐标系，需从裁剪偏移扣除对称 pad 的前侧填充量
+            pad_front = tuple((p - c) // 2 for p, c in
+                              zip(tuple(int(v) for v in window_patch.shape[-3:]),
+                                  crop_shape))
+            self._collect_window_attn(
+                attn_entries, window_attn,
+                tuple(co - pf for co, pf in zip(crop_off, pad_front)),
+                crop_shape)
 
         elapsed = time.time() - start
         result = self._build_result(fid, organ_logits, stitched_mask, elapsed)
@@ -520,7 +539,8 @@ class RADARInferenceEngine:
         overlay_meta = None
         if overlay_path:
             try:
-                overlay_meta = self._export_overlay(image, stitched_mask, overlay_path)
+                overlay_meta = self._export_overlay(image, stitched_mask,
+                                                    overlay_path, attn_entries)
             except Exception:
                 overlay_meta = None
         result['overlay'] = overlay_meta
@@ -535,7 +555,8 @@ class RADARInferenceEngine:
             torch.cuda.empty_cache()
         return result
 
-    def _export_overlay(self, image, stitched_mask, overlay_path):
+    def _export_overlay(self, image, stitched_mask, overlay_path,
+                        attn_entries=None):
         """导出器官分割叠加数据。
 
         image: [1, C, D, H, W]，已归一化到 [0,1]（HU 截断 [-300,400] 后 min-max）。
@@ -561,8 +582,15 @@ class RADARInferenceEngine:
         ct_u8 = np.clip(ct * 255.0, 0, 255).astype(np.uint8)
         mask_u8 = mask.astype(np.uint8)
         os.makedirs(os.path.dirname(overlay_path), exist_ok=True)
+        attn_u8 = None
+        if attn_entries:
+            try:
+                attn_u8 = self._scatter_attention(attn_entries, ct.shape)
+            except Exception:  # noqa: BLE001 - 注意力缺失不阻断 overlay 导出
+                attn_u8 = None
+        kwargs = {'attn': attn_u8} if attn_u8 is not None else {}
         np.savez_compressed(overlay_path, ct=ct_u8, mask=mask_u8,
-                            mask_raw=raw.astype(np.uint8))
+                            mask_raw=raw.astype(np.uint8), **kwargs)
         present = [int(v) for v in np.unique(mask_u8) if v > 0]
         return {
             'num_slices': int(ct_u8.shape[0]),
@@ -570,6 +598,90 @@ class RADARInferenceEngine:
             'width': int(ct_u8.shape[2]),
             'organ_ids': present,
         }
+
+    @staticmethod
+    def _collect_window_attn(entries, window_attn, offset, win_shape):
+        """给每窗注意力条目打全体积偏移标签（sw_batch_size=1，b 恒为 0）。
+
+        offset 为窗在全体积的 (z,y,x) 起点（第二轮补推理可为负，因对称 pad
+        前侧填充超出体积边界）；win_shape 为**裁剪块**体素尺寸（pad 前），
+        散回时按它反推各尺度 token 网格的 3D 维。
+        """
+        off = tuple(int(v) for v in offset)
+        for e in window_attn:
+            e['off'] = off
+            e['win_shape'] = tuple(int(v) for v in win_shape)
+            entries.append(e)
+
+    @staticmethod
+    def _scatter_attention(entries, shape):
+        """把每窗每器官的注意力散回三尺度 token 网格并累加到全体积。
+
+        三尺度网格与窗内坐标的对应（见 vision_branch）：
+          scale1 stride (8,32,32)、scale2 (4,16,16)、scale3 (2,8,8)。
+        各尺度独立归一化后取均值（粗尺度定位大区域、细尺度锐化边界），
+        重叠窗按次数平均。返回 (36,D,H,W) uint8，0=无注意力。
+        在 full_mask 释放后调用，峰值不与滑窗累加器叠加。
+        """
+        strides = ((8, 32, 32), (4, 16, 16), (2, 8, 8))
+        vol = np.zeros((36,) + tuple(shape), dtype=np.float32)
+        cnt = np.zeros((36,) + tuple(shape), dtype=np.float32)
+        for e in entries:
+            oid = e['organ_id']
+            if not (0 <= oid < 36):
+                continue
+            off = e['off']
+            wshape = e.get('win_shape')
+            if not wshape:
+                continue
+            for key_a, key_g, st in (('a1', 'g1', strides[0]),
+                                     ('a2', 'g2', strides[1]),
+                                     ('a3', 'g3', strides[2])):
+                a = np.asarray(e[key_a], dtype=np.float32)
+                g = np.asarray(e[key_g], dtype=bool)
+                # a 是被选 token 的注意力权重（长度=选中数），g 是全网格 bool
+                if a.size == 0 or a.size != int(g.sum()):
+                    continue
+                s = float(a.sum())
+                if s <= 0:
+                    continue
+                a = a / s
+                # token 网格是 flatten 后的 1D bool，按窗尺寸与尺度 stride 反推
+                # 3D 维（max_pool3d kernel=stride 时输出维 = n // k）；不能整除
+                # 的边缘窗（第二轮裁剪）尺寸对不上则跳过该尺度
+                gd = tuple(wshape[i] // st[i] for i in range(3))
+                if gd[0] * gd[1] * gd[2] != g.size:
+                    continue
+                grid = np.zeros(g.shape, dtype=np.float32)
+                grid[g] = a
+                grid = grid.reshape(gd)
+                # 网格上采样到窗体素分辨率（nearest 重复块）
+                up = np.repeat(np.repeat(np.repeat(grid, st[0], 0), st[1], 1),
+                               st[2], 2)
+                d0, d1, d2 = off
+                D, H, W = shape
+                # 偏移可为负（第二轮裁剪窗 pad 前侧超出体积边界）：源区与
+                # 目标区同步裁剪
+                s0, s1, s2 = max(0, -d0), max(0, -d1), max(0, -d2)
+                zd = min(up.shape[0] - s0, D - d0)
+                hd = min(up.shape[1] - s1, H - d1)
+                wd = min(up.shape[2] - s2, W - d2)
+                if zd <= 0 or hd <= 0 or wd <= 0:
+                    continue
+                t0, t1, t2 = d0 + s0, d1 + s1, d2 + s2
+                vol[oid, t0:t0 + zd, t1:t1 + hd, t2:t2 + wd] += \
+                    up[s0:s0 + zd, s1:s1 + hd, s2:s2 + wd]
+                cnt[oid, t0:t0 + zd, t1:t1 + hd, t2:t2 + wd] += 1
+        with np.errstate(invalid='ignore', divide='ignore'):
+            vol = np.where(cnt > 0, vol / np.maximum(cnt, 1), 0.0)
+        # 每器官独立归一化到 [0,255]，便于按分位数取高关注区
+        out = np.zeros_like(vol, dtype=np.uint8)
+        for oid in range(36):
+            ch = vol[oid]
+            mx = ch.max()
+            if mx > 0:
+                out[oid] = np.clip(ch / mx * 255.0, 0, 255).astype(np.uint8)
+        return out
 
     # ------------------------------------------------------------------ #
     # 结果构造

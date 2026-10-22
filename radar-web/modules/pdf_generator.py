@@ -26,7 +26,7 @@ from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.platypus import (
     SimpleDocTemplate, Paragraph, Spacer, Image,
-    Table, TableStyle, KeepTogether, HRFlowable,
+    Table, TableStyle, KeepTogether, HRFlowable, CondPageBreak,
 )
 
 # ---- 版式常量 ----
@@ -48,6 +48,18 @@ SEV_ROW_BG = {
     'low': colors.HexColor('#eafaf1'),
 }
 CONTENT_WIDTH = 17 * cm  # A4 宽 21cm - 左右边距各 2cm
+
+# ---- 标准版式模板（版本化）----
+# 章节间距/标题间距/行距统一定义于此，报告各章节生成时一律引用本模板，
+# 调整排版只改这里；generate_report(layout=...) 可按次针对性覆盖个别键。
+REPORT_LAYOUT = {
+    'version': 2,
+    'section_gap': 0.55 * cm,          # 章节结束后与下一章节标题间的留白
+    'section_title_before': 0,         # 章节标题前额外留白（间隔由上一章 section_gap 提供）
+    'section_title_after': 0.3 * cm,   # 章节标题下划线与正文间的留白
+    'body_leading': 17,                # 正文行距
+    'header_gap': 0.35 * cm,           # 报告头与首章节间的留白
+}
 
 # 患者/检查信息展示顺序（键与 app.py extract_dicom_metadata 输出一致）
 _META_FIELDS = [
@@ -113,8 +125,11 @@ def overall_severity(diagnoses):
 class PDFReportGenerator:
     """PDF医学影像诊断报告生成器（专业中文排版）。"""
 
-    def __init__(self):
+    def __init__(self, layout: Optional[Dict] = None):
         self.font_name, self.font_bold = _register_chinese_fonts()
+        self.layout = dict(REPORT_LAYOUT)
+        if layout:
+            self.layout.update(layout)
         self.styles = self._build_styles()
 
     # ------------------------------------------------------------------ #
@@ -133,8 +148,9 @@ class PDFReportGenerator:
             'subtitle': ps('subtitle', fontSize=9.5, leading=13,
                            alignment=TA_CENTER, textColor=TEXT_SUB),
             'section': ps('section', fontName=self.font_bold, fontSize=13, leading=18,
-                          spaceBefore=4, spaceAfter=4, textColor=PRIMARY),
-            'body': ps('body', fontSize=10, leading=16.5),
+                          spaceBefore=self.layout['section_title_before'],
+                          spaceAfter=2, textColor=PRIMARY),
+            'body': ps('body', fontSize=10, leading=self.layout['body_leading']),
             'small': ps('small', fontSize=8.5, leading=12.5, textColor=TEXT_SUB),
             'cell': ps('cell', fontSize=9, leading=13),
             'cellBold': ps('cellBold', fontName=self.font_bold, fontSize=9, leading=13),
@@ -154,7 +170,8 @@ class PDFReportGenerator:
         return [
             Paragraph(text, self.styles['section']),
             HRFlowable(width='100%', thickness=1.1, color=PRIMARY,
-                       spaceBefore=2, spaceAfter=8),
+                       spaceBefore=2,
+                       spaceAfter=self.layout['section_title_after']),
         ]
 
     # ------------------------------------------------------------------ #
@@ -166,7 +183,8 @@ class PDFReportGenerator:
                         image_slices: Optional[Dict] = None,
                         charts: Optional[Dict] = None,
                         metadata: Optional[Dict] = None,
-                        evidence_images: Optional[List[Dict]] = None) -> str:
+                        evidence_images: Optional[List[Dict]] = None,
+                        layout: Optional[Dict] = None) -> str:
         """生成完整PDF报告。
 
         Args:
@@ -176,10 +194,33 @@ class PDFReportGenerator:
             charts: 兼容旧接口，{name: matplotlib.figure.Figure}
             metadata: 患者/检查元数据（app.py extract_dicom_metadata 输出）
             evidence_images: 证据截图列表 [{'title': str, 'png': bytes}, ...]
+            layout: 针对本次生成的版式覆盖（键见 REPORT_LAYOUT），
+                未提供的键沿用标准模板
 
         Returns:
             str: 生成的PDF文件路径
         """
+        # 按次覆盖版式：生成结束后还原，避免污染单例实例的后续报告
+        saved = None
+        if layout:
+            saved = (dict(self.layout), self.styles)
+            self.layout.update(layout)
+            self.styles = self._build_styles()
+        try:
+            return self._build_report(
+                output_path, diagnosis_result, image_slices, charts,
+                metadata, evidence_images)
+        finally:
+            if saved:
+                self.layout, self.styles = saved
+
+    def _build_report(self,
+                      output_path: str,
+                      diagnosis_result: Dict,
+                      image_slices: Optional[Dict],
+                      charts: Optional[Dict],
+                      metadata: Optional[Dict],
+                      evidence_images: Optional[List[Dict]]) -> str:
         doc = SimpleDocTemplate(
             output_path,
             pagesize=A4,
@@ -191,19 +232,34 @@ class PDFReportGenerator:
             author='RADAR智能影像诊断平台',
         )
 
+        sections = [
+            self._create_patient_section(diagnosis_result, metadata or {}),
+            self._create_summary_section(diagnosis_result),
+            self._create_diagnosis_section(diagnosis_result),
+        ]
+        if evidence_images:
+            sections.append(self._create_evidence_section(evidence_images))
+        if image_slices:
+            sections.append(self._create_image_section(image_slices))
+        if charts:
+            sections.append(self._create_statistics_section(charts))
+        sections.append(self._create_explanation_section(diagnosis_result))
+        sections.append(self._create_conclusion_section(diagnosis_result))
+
+        # 章节间隔统一由版式模板控制：报告头后接 header_gap，其后每章之间
+        # 接 section_gap（空章节跳过，不产生多余留白）
         story = []
         story.extend(self._create_header(diagnosis_result))
-        story.extend(self._create_patient_section(diagnosis_result, metadata or {}))
-        story.extend(self._create_summary_section(diagnosis_result))
-        story.extend(self._create_diagnosis_section(diagnosis_result))
-        if evidence_images:
-            story.extend(self._create_evidence_section(evidence_images))
-        if image_slices:
-            story.extend(self._create_image_section(image_slices))
-        if charts:
-            story.extend(self._create_statistics_section(charts))
-        story.extend(self._create_explanation_section(diagnosis_result))
-        story.extend(self._create_conclusion_section(diagnosis_result))
+        pending_gap = self.layout['header_gap']
+        for sec in sections:
+            if not sec:
+                continue
+            # 页底剩余不足 2.5cm 时先换页，避免章节标题孤悬页底与正文分离
+            story.append(CondPageBreak(2.5 * cm))
+            story.append(Spacer(1, pending_gap))
+            story.extend(sec)
+            pending_gap = self.layout['section_gap']
+        story.append(Spacer(1, pending_gap))
         story.extend(self._create_footer_section())
 
         doc.build(story, onFirstPage=self._draw_page_frame,
@@ -263,7 +319,6 @@ class PDFReportGenerator:
             ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
         ]))
         els.append(info)
-        els.append(Spacer(1, 0.15 * cm))
         return els
 
     # ------------------------------------------------------------------ #
@@ -314,7 +369,6 @@ class PDFReportGenerator:
             style.append(('BACKGROUND', (2, r), (2, r), GRAY_BG))
         table.setStyle(TableStyle(style))
         els.append(table)
-        els.append(Spacer(1, 0.1 * cm))
         return els
 
     # ------------------------------------------------------------------ #
@@ -360,7 +414,6 @@ class PDFReportGenerator:
             ('BOTTOMPADDING', (0, 1), (-1, 1), 8),
         ]))
         els.append(table)
-        els.append(Spacer(1, 0.1 * cm))
         return els
 
     # ------------------------------------------------------------------ #
@@ -442,8 +495,12 @@ class PDFReportGenerator:
 
         table = Table(rows, colWidths=col_widths, repeatRows=1)
         table.setStyle(TableStyle(row_styles))
-        els.append(KeepTogether(table))
-        els.append(Spacer(1, 0.1 * cm))
+        # 短表整表不跨页；长表允许分页（表头 repeatRows 自动重复），
+        # 否则整表被推到下一页、上一页留下大片空白
+        if len(rows) <= 8:
+            els.append(KeepTogether(table))
+        else:
+            els.append(table)
         return els
 
     # ------------------------------------------------------------------ #
@@ -452,30 +509,24 @@ class PDFReportGenerator:
     def _create_evidence_section(self, evidence_images: List[Dict]) -> List:
         els = self._section('四、影像证据')
         els.append(Paragraph(
-            '以下截图取自本次检查CT体数据（模型输入空间），叠加AI分割与注意力热力输出，'
-            '供医师对照上表发现复核原始影像。', self.styles['small']))
+            '以下截图取自本次检查CT体数据（模型输入空间），每组为左右对照：'
+            '左图叠加模型原始输出分割（标记受累器官范围），右图为原始影像并以红圈'
+            '标出病灶定位，供医师对照上表发现复核。', self.styles['small']))
         els.append(Spacer(1, 6))
 
-        # 每行两张，图下配说明文字
-        cells = []
+        # 每组对照图独占一行（图本身已是左右拼接），图下配说明文字
         for item in evidence_images:
             try:
                 from PIL import Image as PILImage
                 png = item['png']
                 w, h = PILImage.open(io.BytesIO(png)).size
-                disp_w = 7.7 * cm
+                disp_w = CONTENT_WIDTH
                 img = Image(io.BytesIO(png), width=disp_w, height=disp_w * h / w)
                 cell = [img, Spacer(1, 3),
                         Paragraph(item.get('title', ''), self.styles['caption'])]
             except Exception:
                 continue
-            cells.append(cell)
-
-        for i in range(0, len(cells), 2):
-            pair = cells[i:i + 2]
-            while len(pair) < 2:
-                pair.append('')
-            row_table = Table([pair], colWidths=[8.5 * cm, 8.5 * cm])
+            row_table = Table([[cell]], colWidths=[CONTENT_WIDTH])
             row_table.setStyle(TableStyle([
                 ('VALIGN', (0, 0), (-1, -1), 'TOP'),
                 ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
@@ -549,7 +600,6 @@ class PDFReportGenerator:
             for lim in limitations:
                 els.append(Paragraph(f'• {lim}', ParagraphStyle(
                     'lim', parent=self.styles['body'], leftIndent=12, leading=15)))
-        els.append(Spacer(1, 0.1 * cm))
         return els
 
     # ------------------------------------------------------------------ #
@@ -616,7 +666,6 @@ class PDFReportGenerator:
             ('LEFTPADDING', (0, 0), (-1, -1), 8),
         ]))
         els.append(sig)
-        els.append(Spacer(1, 8))
         return els
 
     def _create_footer_section(self) -> List:
