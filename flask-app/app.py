@@ -455,13 +455,16 @@ def upload_file():
         if archives and len(files) != 1:
             return jsonify({'success': False,
                             'message': '压缩包请单独上传，不要与其他文件混选'}), 400
-        # 非压缩包文件的扩展名校验。多文件/文件夹路径放宽为「无扩展名也放行」，
-        # 因为无扩展名 DICOM 极为常见，真伪交给落盘后的文件头嗅探判定。
-        for item in files:
-            if is_archive_name(item.filename):
-                continue
-            if len(files) == 1 and not allowed_file(item.filename):
-                return jsonify({'success': False, 'message': '包含不支持的文件格式'}), 400
+        # 非压缩包文件的扩展名校验仅在多文件场景做「明确不支持扩展名」的
+        # 预拒（避免把上千个噪声文件塞进 FormData）。单文件不看扩展名：
+        # PACS/光盘导出的单张切片常用 .ima/.dic/无扩展名/纯 UID 命名，
+        # 扩展名白名单会把真切片误拒（多文件路径本就靠落盘后文件头嗅探）。
+        if len(files) > 1:
+            for item in files:
+                if is_archive_name(item.filename):
+                    continue
+                if not allowed_file(item.filename):
+                    return jsonify({'success': False, 'message': '包含不支持的文件格式'}), 400
 
         timestamp = datetime.now().strftime('%Y%m%d%H%M%S%f')
         geometry = {}
