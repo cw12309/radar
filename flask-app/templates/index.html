@@ -22,6 +22,10 @@
                     <span class="icon">🔍</span>
                     <span>影像诊断</span>
                 </a>
+                <a href="#" class="nav-item" data-page="library">
+                    <span class="icon">🗂️</span>
+                    <span>院内影像库</span>
+                </a>
                 <a href="#" class="nav-item" data-page="batch">
                     <span class="icon">📊</span>
                     <span>批量处理</span>
@@ -65,7 +69,11 @@
             <!-- 文件上传区 -->
             <div class="upload-section card">
                 <div class="card-header">
-                    <h3>📤 上传影像文件</h3>
+                    <h3>📥 载入影像</h3>
+                    <div class="upload-tabs">
+                        <button class="upload-tab active" type="button" data-upload-tab="external">外部导入（上传）</button>
+                        <button class="upload-tab" type="button" data-upload-tab="library">院内影像库</button>
+                    </div>
                 </div>
                 <div class="card-body">
                     <div class="upload-area" id="uploadArea">
@@ -80,6 +88,16 @@
                         <button class="btn btn-secondary" onclick="document.getElementById('folderInput').click()">
                             选择文件夹
                         </button>
+                    </div>
+
+                    <!-- 院内影像库入口：服务器已有数据，无需下载再上传 -->
+                    <div class="library-entry" id="libraryEntry" hidden>
+                        <div class="library-entry-icon">🗂️</div>
+                        <div class="library-entry-text">
+                            <strong>服务器上已有 <span id="libraryEntryCount">-</span> 例脱敏腹部 CT</strong>
+                            <p>按病种分类浏览，选中一个轴位序列即可零拷贝进入阅片与诊断，不必把几十 GB 数据下载到本地再传回来。</p>
+                        </div>
+                        <button class="btn btn-primary" id="libraryEntryBtn" type="button">浏览院内影像库</button>
                     </div>
                     
                     <!-- 文件信息 -->
@@ -139,6 +157,11 @@
                             <a class="btn btn-secondary viewer-external-link" id="openOhifNewTab" href="#" target="_blank" rel="noopener">新窗口打开查看器 ↗</a>
                         </div>
                         <div class="viewer-content ohif-viewer-content">
+                            <div id="webglWarn" class="webgl-warn" hidden>
+                                <strong>查看器主视口无法渲染：当前浏览器 WebGL2 不可用</strong>
+                                （影像数据已正常加载，左侧缩略图不受影响，这是纯渲染环境问题，与数据无关）
+                                <span>解决办法任选其一后刷新：① Chrome 设置 → 系统 → 打开「使用硬件加速模式（如果可用）」并重启浏览器；② 无显卡/远程桌面环境在地址栏输入 <code>chrome://flags/#enable-unsafe-swiftshader</code> 设为 Enabled 后重启（允许软件渲染）；③ 点右上「新窗口打开查看器」重试。</span>
+                            </div>
                             <iframe id="ohifViewerFrame" title="OHIF医学影像查看器" allow="fullscreen" style="width:100%;height:720px;border:0;background:#05070a;"></iframe>
                         </div>
                     </div>
@@ -174,6 +197,24 @@
                         <span class="card-title-note" id="resultMetaSource"></span>
                     </div>
                     <div class="info-grid" id="resultMetaGrid"></div>
+                </div>
+
+                <!-- 原始报告对照（仅库内导入的病例有） -->
+                <div class="result-card card" id="originalReportCard" style="display: none;">
+                    <div class="card-title-row">
+                        <h4>院内原始报告对照</h4>
+                        <span class="card-title-note" id="originalReportNote"></span>
+                    </div>
+                    <div class="report-compare">
+                        <div class="report-pane">
+                            <div class="report-pane-head">原始报告（人工）</div>
+                            <div class="report-pane-body" id="originalReportBody"></div>
+                        </div>
+                        <div class="report-pane">
+                            <div class="report-pane-head">RADAR 发现（AI）</div>
+                            <div class="report-pane-body" id="aiReportBody"></div>
+                        </div>
+                    </div>
                 </div>
 
                 <!-- 输入适用性警告（扫描范围/对比剂不满足训练分布时显示） -->
@@ -362,6 +403,116 @@
             </div>
         </div>
 
+        <!-- 院内影像库页面 -->
+        <div id="library-page" class="page">
+            <div class="page-header lib-header">
+                <div>
+                    <div class="workflow-kicker">IN-HOUSE IMAGE LIBRARY</div>
+                    <h2>院内影像库</h2>
+                    <p>直接选用服务器上已有的脱敏 CT 阅片诊断，无需下载再上传。选中序列后零拷贝进入 OHIF 与 AI 诊断。</p>
+                </div>
+                <div class="lib-header-actions">
+                    <span class="lib-stat" id="libStat">加载中…</span>
+                    <button class="btn btn-secondary btn-sm" id="libRefreshBtn" type="button">↻ 重载索引</button>
+                </div>
+            </div>
+
+            <div class="lib-layout">
+                <!-- 左：三级分类树 -->
+                <aside class="card lib-tree-card">
+                    <div class="card-header lib-tree-head">
+                        <h3>病例分类</h3>
+                        <span class="card-title-note" id="libTreeNote"></span>
+                    </div>
+                    <div class="card-body lib-tree-body">
+                        <div id="libTree" class="lib-tree"></div>
+                    </div>
+                </aside>
+
+                <!-- 右：筛选 + 病例表 -->
+                <section class="lib-main">
+                    <div class="card lib-filter-card">
+                        <div class="lib-filter-row">
+                            <input type="search" id="libKeyword" class="input" placeholder="搜索病历号 / 姓名 / 检查号 / 病名…">
+                            <select id="libModality" class="select">
+                                <option value="">全部模态</option>
+                                <option value="CT">CT</option>
+                                <option value="MR">MR</option>
+                            </select>
+                            <label class="checkbox-inline"><input type="checkbox" id="libHasDicom" checked> 有影像</label>
+                            <label class="checkbox-inline"><input type="checkbox" id="libHasReport"> 有报告</label>
+                            <select id="libStatus" class="select">
+                                <option value="">全部状态</option>
+                                <option value="published">已发布</option>
+                                <option value="draft">草稿</option>
+                            </select>
+                            <button class="btn btn-primary btn-sm" id="libSearchBtn" type="button">查询</button>
+                            <button class="btn btn-secondary btn-sm" id="libResetBtn" type="button">重置</button>
+                            <label class="checkbox-inline lib-path-scan">
+                                <button class="btn btn-secondary btn-sm" id="libScanBtn" type="button" title="扫描服务器上任意 DICOM 目录">📂 导入服务器目录</button>
+                            </label>
+                        </div>
+                        <div class="lib-crumb" id="libCrumb">全部分类</div>
+                    </div>
+
+                    <div class="card lib-table-card">
+                        <div class="lib-table-wrap">
+                            <table class="lib-table" id="libTable">
+                                <thead>
+                                    <tr>
+                                        <th>病历号</th>
+                                        <th>姓名</th>
+                                        <th>性别/年龄</th>
+                                        <th>分类</th>
+                                        <th>病名</th>
+                                        <th>影像</th>
+                                        <th>报告</th>
+                                        <th class="col-action"></th>
+                                    </tr>
+                                </thead>
+                                <tbody id="libTableBody">
+                                    <tr><td colspan="8" class="lib-empty">加载中…</td></tr>
+                                </tbody>
+                            </table>
+                        </div>
+                        <div class="lib-pager" id="libPager"></div>
+                    </div>
+                </section>
+            </div>
+
+            <!-- 病例详情抽屉：检查 → 序列选择 -->
+            <div class="lib-drawer" id="libDrawer" hidden>
+                <div class="lib-drawer-mask" data-close="1"></div>
+                <div class="lib-drawer-panel" role="dialog" aria-modal="true">
+                    <header class="lib-drawer-head">
+                        <div>
+                            <h3 id="libDrawerTitle">病例详情</h3>
+                            <div class="lib-drawer-sub" id="libDrawerSub"></div>
+                        </div>
+                        <button class="btn-icon-only" type="button" data-close="1" aria-label="关闭">✕</button>
+                    </header>
+
+                    <div class="lib-drawer-body">
+                        <div class="lib-drawer-col">
+                            <div class="lib-section-head">
+                                <h4>检查与序列</h4>
+                                <span class="card-title-note" id="libSeriesNote"></span>
+                            </div>
+                            <div id="libExamList" class="lib-exam-list"></div>
+                        </div>
+
+                        <div class="lib-drawer-col">
+                            <div class="lib-section-head">
+                                <h4>原始报告</h4>
+                                <span class="card-title-note" id="libReportNote">来自院内教学库，仅供对照</span>
+                            </div>
+                            <div id="libReportList" class="lib-report-list"></div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
         <!-- 批量处理页面 -->
         <div id="batch-page" class="page">
             <div class="page-header">
@@ -391,9 +542,27 @@
             <div class="history-list card">
                 <div class="card-header">
                     <h3>历史记录</h3>
+                    <span class="card-title-note">点击任意记录查看完整诊断结果</span>
                 </div>
                 <div class="card-body">
                     <div id="historyList" class="history-items"></div>
+                </div>
+            </div>
+
+            <!-- 历史记录详情抽屉：展示入库的完整诊断结果（explanation/top_scores/
+                 warnings/metadata）与库内病例的原始报告对照。列表接口只带小摘要，
+                 完整数据按需从这里加载。 -->
+            <div class="lib-drawer" id="historyDrawer" hidden>
+                <div class="lib-drawer-mask" data-hist-close="1"></div>
+                <div class="lib-drawer-panel" role="dialog" aria-modal="true">
+                    <header class="lib-drawer-head">
+                        <div>
+                            <h3 id="histDrawerTitle">诊断记录详情</h3>
+                            <div class="lib-drawer-sub" id="histDrawerSub"></div>
+                        </div>
+                        <button class="btn-icon-only" type="button" data-hist-close="1" aria-label="关闭">✕</button>
+                    </header>
+                    <div class="lib-drawer-body" id="histDrawerBody"></div>
                 </div>
             </div>
         </div>
@@ -460,6 +629,7 @@
     <!-- Toast通知 -->
     <div id="toast" class="toast"></div>
 
+    <script src="{{ url_for('static', filename='js/library.js') }}"></script>
     <script src="{{ url_for('static', filename='js/app.js') }}"></script>
 </body>
 </html>

@@ -166,6 +166,11 @@ module.exports = (env, argv) => {
             setHeaders,
           },
           publicPath: '/viewer-testdata',
+          // dev-server 用 chokidar 递归 watch static 目录（实际会一路 watch 到
+          // monorepo 根 ../..，两万多目录），本机 inotify 上限只有 65536，
+          // 直接触发 "ENOSPC: System limit for number of file watchers reached"
+          // 让 dev server 崩溃。testdata 只读，无需热更新，关掉 watch。
+          watch: false,
         },
       ],
       //public: 'http://localhost:' + 3000,
@@ -205,6 +210,15 @@ module.exports = (env, argv) => {
       })
     );
   }
+
+  // dev server 默认会递归 watch 整个 monorepo（含上千个 node_modules 目录），
+  // 在本机 fs.inotify.max_user_watches=65536 的限制下会直接抛
+  // "ENOSPC: System limit for number of file watchers reached" 使 dev server 崩溃。
+  // 依赖无需热更新，忽略 node_modules 即可把 watcher 数量压到限制以内。
+  mergedConfig.watchOptions = {
+    ...mergedConfig.watchOptions,
+    ignored: ['**/node_modules', '**/.git', '**/dist'],
+  };
 
   return mergedConfig;
 };

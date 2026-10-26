@@ -128,8 +128,14 @@ window.config = {
       configuration: {
         friendlyName: 'Static WADO Local Data',
         name: 'DCM4CHEE',
-        qidoRoot: 'http://127.0.0.1:5000/dicomweb',
-        wadoRoot: 'http://127.0.0.1:5000/dicomweb',
+        // 必须用相对路径：dev server 已配置 '/dicomweb' -> http://localhost:5000
+        // 的代理（见 .webpack/webpack.pwa.js）。写死 http://127.0.0.1:5000 时，
+        // 从远程机器打开 viewer 的浏览器会把 127.0.0.1 解析成客户端自己，
+        // 请求全部连不上，dicomweb-client 抛 "Error: request failed"。
+        // 同源相对路径还顺带规避了跨域 CORS 问题。
+        wadoUriRoot: '/dicomweb',
+        qidoRoot: '/dicomweb',
+        wadoRoot: '/dicomweb',
         qidoSupportsIncludeField: false,
         supportsReject: true,
         supportsStow: true,

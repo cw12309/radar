@@ -1,5 +1,5 @@
 # RADAR one-click startup script
-# Starts Flask (5000) + OHIF viewer (3001) in the background and streams
+# Starts Flask (5000) + OHIF viewer (3002) in the background and streams
 # both services' logs into THIS terminal.
 #   .\start_radar_system.ps1          start + tail logs
 #   .\start_radar_system.ps1 -Stop    stop the services started by this script
@@ -16,12 +16,13 @@ $FlaskLog = Join-Path $LogDir 'flask.log'
 $OhifLog = Join-Path $LogDir 'ohif.log'
 $PidFile = Join-Path $LogDir 'services.pid'
 
-# OHIF port. Port 3000 is already taken by a local Docker container
-# (Milvus admin GUI "attu"). Reusing 3000 makes the Test-Port check below
-# wrongly assume "OHIF is already running" and skip startup, so the frontend
-# iframe ends up hitting attu and shows a database UI instead of the viewer.
+# OHIF port. Ports 3000/3001 are taken by local Docker containers
+# (3000 = apisix-prod-grafana-1, 3001 = bzh-server-bzh-server-1). Reusing an
+# occupied port makes the Test-Port check below wrongly assume "OHIF is already
+# running" and skip startup, so the frontend iframe ends up hitting the other
+# service and the viewer throws "Invalid study URL".
 # Must match OHIF_PORT in flask-app\app.py and static\js\app.js.
-$OhifPort = 3001
+$OhifPort = 3002
 
 function Test-Port($Port) {
     try {

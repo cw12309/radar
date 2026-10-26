@@ -13,6 +13,7 @@ import threading
 import time
 import subprocess
 import shutil
+import socket
 import zipfile
 import tarfile
 from collections import OrderedDict
@@ -35,6 +36,7 @@ from inference_engine import RADARInferenceEngine, RADARInferenceError, _postpro
 from pdf_generator import PDFReportGenerator
 from batch_processor import BatchProcessor
 from history_manager import HistoryManager
+from library_service import get_library, LIB_PREFIX
 
 # 初始化Flask应用
 app = Flask(__name__)
@@ -44,10 +46,16 @@ app.config['MAX_CONTENT_LENGTH'] = 500 * 1024 * 1024  # 500MB
 app.config['SETTINGS_FILE'] = os.path.join(current_dir, 'settings.json')
 CORS(app)
 
-# OHIF 查看器端口。默认 3001 而非 3000，因为 3000 已被本机 Docker 容器
-# （Milvus 管理 GUI attu）占用，OHIF 若沿用 3000 会导致 iframe 打到别的服务上。
-# 必须与 start_radar_system.ps1 中的 $OhifPort 保持一致，可用环境变量覆盖。
-OHIF_PORT = int(os.environ.get('OHIF_PORT', 3001))
+# 院内影像库注册表：把 lib_<hash> 映射到磁盘上的原始序列目录。与 settings.json
+# 分开存放，因为注册表随导入动态增长，而 settings 是人工维护的配置。
+LIBRARY_REGISTRY_FILE = os.path.join(current_dir, 'library_registry.json')
+
+# OHIF 查看器端口。默认 3002 而非 3000/3001，因为本机 Docker 容器已占用：
+# 3000 = apisix-prod-grafana-1，3001 = bzh-server-bzh-server-1。
+# OHIF 若沿用被占端口，iframe 会打到别的服务上，前端 QIDO 拿不到 study，
+# viewer 就抛 "Invalid study URL"。必须与 start_radar_system.ps1 的 $OhifPort
+# 及 static/js/app.js 的 OHIF_PORT 保持一致，可用环境变量覆盖。
+OHIF_PORT = int(os.environ.get('OHIF_PORT', 3002))
 
 # 每次上传都会把体数据展开成整套 DICOM 序列写入 %TEMP%\ohif\<study_uid>\，
 # 一份中等病例就是几十 MB，且原先没有任何回收逻辑（实测累积到 22 个 study、
@@ -55,12 +63,24 @@ OHIF_PORT = int(os.environ.get('OHIF_PORT', 3001))
 # 这里按数量上限回收最旧的 study，当前正在看的那个始终保留。
 MAX_OHIF_STUDIES = int(os.environ.get('MAX_OHIF_STUDIES', 5))
 
+# 院内影像库快照目录（由 qinghua-report 的 export_abdomen.py 生成）。可用
+# LIBRARY_ROOTS 环境变量以 os.pathsep 分隔覆盖，便于换机器部署时改路径。
+DEFAULT_LIBRARY_ROOTS = [
+    {
+        'name': '清华长庚·腹部影像',
+        'path': '/home/rimagai/data2/qinghua-report/datasets/abdomen-export',
+    },
+]
+
 DEFAULT_SETTINGS = {
     'theme': 'dark',
     'language': 'zh-CN',
     'confidence_threshold': 0.7,
     'use_gpu': True,
-    'viewer_source': 'local5000'
+    'viewer_source': 'local5000',
+    # 院内影像库快照根目录。导入时把整个原始 study 目录注册给 DICOMweb，
+    # OHIF 因此能切换平扫/动脉期/静脉期/冠矢状位等全部真实序列。
+    'library_roots': DEFAULT_LIBRARY_ROOTS
 }
 
 
@@ -76,6 +96,36 @@ def read_settings():
 def write_settings(settings):
     with open(app.config['SETTINGS_FILE'], 'w', encoding='utf-8') as f:
         json.dump(settings, f, ensure_ascii=False, indent=2)
+
+
+def resolve_library_roots():
+    """解析生效的影像库根目录列表（环境变量 > settings > 默认值）。"""
+    env = os.environ.get('LIBRARY_ROOTS')
+    if env:
+        return [{'path': p} for p in env.split(os.pathsep) if p.strip()]
+    return read_settings().get('library_roots') or DEFAULT_LIBRARY_ROOTS
+
+
+library = get_library()
+library.configure(resolve_library_roots(), LIBRARY_REGISTRY_FILE)
+
+
+def resolve_file_path(file_id):
+    """file_id → 磁盘真实路径。
+
+    全项目原先有 6 处 os.path.join(UPLOAD_FOLDER, file_id) 的硬编码，只能指向
+    上传目录。影像库引入 lib_<hash> 形式的 file_id 后，这些位置必须统一走本
+    函数：库内 id 经注册表解析到原始序列目录（零拷贝，47 GB 的腹部数据不必
+    先复制进 temp），其余 id 仍按上传目录拼接。
+    """
+    if isinstance(file_id, str) and file_id.startswith(LIB_PREFIX):
+        path = library.resolve(file_id)
+        if path is not None:
+            return path
+        # 注册表丢失（例如手工删了 library_registry.json）时给出明确错误，
+        # 而不是静默落到 UPLOAD_FOLDER 下拼出一个不存在的路径、再报「文件不存在」。
+        raise FileNotFoundError(f'影像库条目 {file_id} 未注册或已失效，请重新从影像库导入')
+    return os.path.join(app.config['UPLOAD_FOLDER'], file_id)
 
 # 初始化组件
 file_handler = FileHandler()
@@ -115,6 +165,103 @@ def get_organ_names():
     except Exception as exc:  # noqa: BLE001 - 拿不到器官名不应让 overlay 崩
         app.logger.warning('[organs] 加载器官元数据失败: %s', exc)
     return _ORGAN_NAMES
+
+
+INFER_SOCK = os.path.join(tempfile.gettempdir(), 'radar_infer.sock')
+_INFER_DAEMON_LOCK = threading.Lock()
+
+
+def _infer_daemon_alive():
+    """守护进程是否就绪：socket 存在且能连上（连不上视为未就绪）。"""
+    if not os.path.exists(INFER_SOCK):
+        return False
+    try:
+        probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        probe.settimeout(2)
+        probe.connect(INFER_SOCK)
+        probe.close()
+        return True
+    except OSError:
+        return False
+
+
+def ensure_infer_daemon():
+    """确保常驻推理守护进程在跑；不在则后台拉起（幂等，带锁防并发重复拉起）。
+
+    模型权重在守护进程里只加载一次，之后所有诊断复用，不再「用一次加载一次」。
+    拉起是异步的：加载权重的数十秒内本次诊断自动走一次性子进程兜底，用户无感。
+    """
+    with _INFER_DAEMON_LOCK:
+        if _infer_daemon_alive():
+            return True
+        use_gpu = bool(read_settings().get('use_gpu', True))
+        cmd = [sys.executable, os.path.join(current_dir, 'infer_daemon.py'),
+               '--socket', INFER_SOCK]
+        if use_gpu:
+            cmd.append('--use-gpu')
+        log_path = os.path.join(tempfile.gettempdir(), 'radar_infer_daemon.log')
+        try:
+            logf = open(log_path, 'a', encoding='utf-8')
+            subprocess.Popen(cmd, stdout=logf, stderr=subprocess.STDOUT,
+                             cwd=current_dir, start_new_session=True)
+            app.logger.info('[infer-daemon] 拉起常驻推理进程 (use_gpu=%s)', use_gpu)
+            return True
+        except OSError as exc:
+            app.logger.warning('[infer-daemon] 拉起失败，本次走一次性子进程: %s', exc)
+            return False
+
+
+def run_inference_daemon(nifti_path, overlay_path=None, timeout=1800):
+    """向常驻守护进程提交一次推理；返回与 run_inference_subprocess 相同的三元组。
+
+    任何连接/协议异常都返回错误串，由调用方降级到一次性子进程，保证可用性。
+    """
+    try:
+        conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        conn.settimeout(timeout)
+        conn.connect(INFER_SOCK)
+    except OSError as exc:
+        return None, [], f'daemon 连接失败: {exc}'
+    try:
+        with conn:
+            conn.sendall((json.dumps(
+                {'nifti': nifti_path, 'overlay': overlay_path},
+                ensure_ascii=False) + '\n').encode('utf-8'))
+            buf = b''
+            while b'\n' not in buf:
+                chunk = conn.recv(1 << 20)
+                if not chunk:
+                    return None, [], 'daemon 连接提前关闭'
+                buf += chunk
+        payload = json.loads(buf.split(b'\n', 1)[0].decode('utf-8'))
+    except (OSError, socket.timeout, json.JSONDecodeError, UnicodeDecodeError) as exc:
+        return None, [], f'daemon 通信失败: {exc}'
+    organs = payload.get('organs') or []
+    if organs:
+        global _ORGAN_NAMES
+        _ORGAN_NAMES = list(organs)
+    if not payload.get('success'):
+        return None, organs, payload.get('error', '推理失败')
+    return payload.get('result'), organs, None
+
+
+def run_inference(nifti_path, overlay_path=None, timeout=1800):
+    """推理统一入口：优先常驻守护进程，失败自动降级一次性子进程并重新拉起守护。
+
+    守护进程崩溃（OOM 等）时本次诊断不失败：先用短命子进程把结果给用户，
+    同时后台重新拉起守护，下一次诊断恢复常驻模式。
+    """
+    if _infer_daemon_alive():
+        result, organs, err = run_inference_daemon(nifti_path, overlay_path, timeout)
+        if err is None:
+            return result, organs, None
+        app.logger.warning('[infer] 常驻进程异常（%s），降级一次性子进程并重新拉起守护',
+                           err[:80])
+        threading.Thread(target=ensure_infer_daemon, daemon=True).start()
+        return run_inference_subprocess(nifti_path, overlay_path, timeout)
+    # 守护不在：本次走子进程兜底，同时后台拉起守护供后续诊断复用
+    threading.Thread(target=ensure_infer_daemon, daemon=True).start()
+    return run_inference_subprocess(nifti_path, overlay_path, timeout)
 
 
 def run_inference_subprocess(nifti_path, overlay_path=None, timeout=1800):
@@ -665,7 +812,7 @@ def get_image_slice(file_id, slice_idx):
         window_width: 窗宽
     """
     try:
-        filepath = os.path.join(app.config['UPLOAD_FOLDER'], file_id)
+        filepath = resolve_file_path(file_id)
         if not os.path.exists(filepath):
             return jsonify({'success': False, 'message': '文件不存在'}), 404
         
@@ -719,7 +866,7 @@ def get_multiview_images(file_id):
     返回轴位、矢状位、冠状位的中心切片
     """
     try:
-        filepath = os.path.join(app.config['UPLOAD_FOLDER'], file_id)
+        filepath = resolve_file_path(file_id)
         if not os.path.exists(filepath):
             return jsonify({'success': False, 'message': '文件不存在'}), 404
         
@@ -1129,6 +1276,12 @@ def get_dicom_study_dir(study_uid):
     upload_dir = Path(app.config['UPLOAD_FOLDER']) / 'ohif' / study_uid
     if upload_dir.is_dir():
         return upload_dir
+    # 影像库注册的原始 study：目录是 <study>/<series>/*.dcm 两层结构，由
+    # dicom_files 递归展开。这样 OHIF 能切换平扫/动脉期/静脉期/冠矢状位等
+    # 全部真实序列，并显示真实采集参数，而不是上传路径重写出的单个合成序列。
+    lib_dir = library.study_dir(study_uid)
+    if lib_dir:
+        return Path(lib_dir)
     folder_uid, _ = find_folder_study()
     if folder_uid == study_uid:
         return Path(current_dir).parent / 'data' / 'test_ct_dicom_series'
@@ -1136,11 +1289,56 @@ def get_dicom_study_dir(study_uid):
 
 
 def dicom_files(study_dir):
-    return sorted(path for path in study_dir.glob('*.dcm')) if study_dir and study_dir.is_dir() else []
+    """列出 study 目录下全部 DICOM 文件（有序）。
+
+    上传导出的 study 是平铺的 <n>.dcm，院内原始数据是 <study>/<series>/*.dcm
+    两层，故用 rglob 兼容两种布局。文件名排序不影响解剖顺序——原始切片以
+    SOPInstanceUID 命名，真正的层序由 pydicom 的 SliceLocation 排序键决定。
+    """
+    if not study_dir or not study_dir.is_dir():
+        return []
+    return sorted(path for path in study_dir.rglob('*.dcm') if path.is_file())
 
 
 def dicom_json(dataset):
     return dataset.to_json_dict()
+
+
+# 院内原始 study 的指纹缓存。这些目录是 root 属主的只读快照，内容不会变；
+# 而一个腹部 CT study 可能有上千个 .dcm 分布在十几个序列子目录里，若在
+# DICOMweb 热路径上每次请求都递归 walk 一遍，光是 stat 就要几十毫秒，OHIF
+# 并发预取上百帧时会明显拖慢出片。故只算一次并长期缓存。
+_LIB_STUDY_STAMP_CACHE = {}
+_LIB_STUDY_STAMP_LOCK = threading.Lock()
+
+
+def _walk_dicom_stamp(study_dir):
+    """递归统计 .dcm 文件数与最新 mtime，用 os.scandir 复用目录项的 stat。"""
+    count = 0
+    newest = 0.0
+    stack = [str(study_dir)]
+    while stack:
+        current = stack.pop()
+        try:
+            with os.scandir(current) as it:
+                for entry in it:
+                    try:
+                        if entry.is_dir(follow_symlinks=True):
+                            stack.append(entry.path)
+                            continue
+                        if not entry.name.endswith('.dcm'):
+                            continue
+                        count += 1
+                        mtime = entry.stat(follow_symlinks=True).st_mtime
+                        if mtime > newest:
+                            newest = mtime
+                    except OSError:
+                        continue
+        except OSError:
+            return None
+    if count == 0:
+        return None
+    return (count, newest)
 
 
 def _study_dir_stamp(study_dir):
@@ -1149,11 +1347,21 @@ def _study_dir_stamp(study_dir):
     重新上传（新目录）或 prune_ohif_studies 回收后指纹会变，缓存自然失效，
     不需要显式清理，也不会读到被删目录的旧数据。
 
-    必须用 os.scandir 而不是 Path.glob + 逐个 stat：本函数在每个 DICOMweb
-    请求（含每张切片的 /frames/1）的热路径上都要跑一次，368 个文件的
-    glob+getmtime 实测 387ms，而 scandir 复用目录项自带的 stat 结果只要
-    1.6ms。OHIF 并发预取上百张时，这 385ms 的差距直接决定请求是否超时。
+    上传导出的 study 是平铺目录，用 scandir 单层扫描即可；院内原始 study
+    是只读快照，走上面的长期缓存，避免在 /frames/1 热路径上反复递归。
     """
+    key = str(study_dir)
+    if library.study_dir(Path(study_dir).name) == os.path.realpath(key):
+        with _LIB_STUDY_STAMP_LOCK:
+            cached = _LIB_STUDY_STAMP_CACHE.get(key)
+        if cached is not None:
+            return cached
+        stamp = _walk_dicom_stamp(study_dir)
+        if stamp is not None:
+            with _LIB_STUDY_STAMP_LOCK:
+                _LIB_STUDY_STAMP_CACHE[key] = stamp
+        return stamp
+
     count = 0
     newest = 0.0
     try:
@@ -1256,6 +1464,8 @@ def dicomweb_studies():
     upload_root = Path(app.config['UPLOAD_FOLDER']) / 'ohif'
     if not study_uid and upload_root.is_dir():
         candidate_uids.extend(path.name for path in upload_root.iterdir() if path.is_dir())
+    if not study_uid:
+        candidate_uids.extend(library.registered_study_uids())
     for uid in dict.fromkeys(uid for uid in candidate_uids if uid):
         index = get_dicom_index(uid)
         if index is not None:
@@ -1418,6 +1628,14 @@ def export_ohif_study(file_id, image_data, file_type, geometry=None):
         meta.MediaStorageSOPInstanceUID = generate_uid()
         meta.TransferSyntaxUID = ExplicitVRLittleEndian
         ds = FileDataset(None, {}, file_meta=meta, preamble=b'\x00' * 128)
+        # pydicom 2.4 从空 dict 构造 FileDataset 时 is_implicit_VR 会落到隐式 VR，
+        # 而 file_meta 声明的 TransferSyntaxUID 是 ExplicitVRLittleEndian，文件头
+        # 声明与数据集编码不一致：服务端 pydicom 读取能自动回退（只告警），但
+        # 浏览器 dicom-parser 严格按声明的传输语法解析，直接抛
+        # "parseDicomDataSetExplicit: buffer overrun"，OHIF 视口永远灰屏。
+        # 这里显式钉死编码，保证声明与实体一致。
+        ds.is_implicit_VR = False
+        ds.is_little_endian = True
         ds.SOPClassUID = CTImageStorage
         ds.SOPInstanceUID = meta.MediaStorageSOPInstanceUID
         ds.StudyInstanceUID = study_uid
@@ -1457,6 +1675,369 @@ def find_series_uid(study_dir):
             return f.read().strip()
     except OSError:
         return None
+
+
+# ==================== 院内影像库 ====================
+#
+# 服务器本地已有数十 GB 的脱敏 CT，而 /api/upload 只接受浏览器 multipart 上传，
+# 等于要求用户先把数据下载到自己机器再传回来。下面这组接口让前端能直接浏览
+# 快照目录、按序列粒度选用已有数据，零拷贝接入现有的 OHIF + 诊断链路。
+
+def _library_error(message, status=400):
+    return jsonify({'success': False, 'message': message}), status
+
+
+@app.route('/api/library/status', methods=['GET'])
+def library_status():
+    """影像库根目录装载状态（便于排查「列表为空」是配置问题还是数据问题）。"""
+    library.refresh()
+    return jsonify({'success': True, 'roots': library.status(),
+                    'registry_entries': len(library._registry)})
+
+
+@app.route('/api/library/refresh', methods=['POST'])
+def library_refresh():
+    """重新读取快照目录（导出脚本重跑后调用），并按 settings 重载根目录配置。"""
+    library.configure(resolve_library_roots(), LIBRARY_REGISTRY_FILE)
+    library.refresh()
+    return jsonify({'success': True, 'roots': library.status()})
+
+
+@app.route('/api/library/tree', methods=['GET'])
+def library_tree():
+    """三级分类树（系统 → 病种 → 具体病名）+ 各级病例数。"""
+    library.refresh()
+    return jsonify({'success': True, 'data': library.tree()})
+
+
+@app.route('/api/library/cases', methods=['GET'])
+def library_cases():
+    """病例列表：支持分类/关键词/模态/有无影像/有无报告/发布状态筛选 + 分页。"""
+    library.refresh()
+    args = request.args
+
+    def bool_or_none(name):
+        raw = (args.get(name) or '').strip().lower()
+        if raw in ('1', 'true', 'yes'):
+            return True
+        if raw in ('0', 'false', 'no'):
+            return False
+        return None
+
+    try:
+        result = library.query_cases(
+            root=args.get('root') or None,
+            category=args.get('category') or None,
+            keyword=args.get('keyword') or None,
+            modality=args.get('modality') or None,
+            has_dicom=bool_or_none('has_dicom'),
+            has_report=bool_or_none('has_report'),
+            status=args.get('status') or None,
+            page=args.get('page', 1),
+            page_size=args.get('page_size', 20),
+        )
+    except ValueError as exc:
+        return _library_error(f'查询参数不合法: {exc}')
+    return jsonify({'success': True, **result})
+
+
+@app.route('/api/library/case/<case_id>', methods=['GET'])
+def library_case_detail(case_id):
+    """病例详情：检查列表（含序列概要）+ 报告全文。"""
+    library.refresh()
+    detail = library.case_detail(case_id)
+    if detail is None:
+        return _library_error('病例不存在', 404)
+    return jsonify({'success': True, 'data': detail})
+
+
+@app.route('/api/library/examination/<examination_id>/series', methods=['GET'])
+def library_exam_series(examination_id):
+    """某检查的全部序列 + RADAR 适用性评估 + 推荐项。
+
+    评估必须显式给出「不可用原因」：把定位像、剂量报告或冠状位重建喂进
+    RADAR 不会报错，只会静默产出解剖错乱的诊断结果，比直接失败更危险。
+    """
+    library.refresh()
+    force = request.args.get('refresh', '').lower() in ('1', 'true')
+    data = library.series_of_exam(examination_id, force=force)
+    if data is None:
+        return _library_error('检查不存在', 404)
+    return jsonify({'success': True, 'data': data})
+
+
+@app.route('/api/library/import', methods=['POST'])
+def library_import():
+    """把库内某个序列登记为 file_id，返回与 /api/upload 同构的 info。
+
+    零拷贝：不复制 DICOM，只把 lib_<hash> → 原始序列目录写进注册表；同时把
+    整个原始 study 目录登记给 DICOMweb，使 OHIF 能加载全部真实序列。
+    """
+    library.refresh()
+    payload = request.get_json(silent=True) or {}
+    series_id = (payload.get('series_id') or '').strip()
+    if not series_id:
+        return _library_error('缺少 series_id')
+
+    hit, root = library.find_series(series_id)
+    if hit is None:
+        return _library_error(f'序列不存在: {series_id}', 404)
+    series, exam = hit['series'], hit['exam']
+
+    series_dir = root._series_host_dir(exam, series)
+    if not series_dir or not os.path.isdir(series_dir):
+        return _library_error(
+            f'序列目录在服务器上不可读: {series_dir or "(未解析)"}', 404)
+
+    study_dir = exam.get('host_storage_path')
+    if not study_dir or not os.path.isdir(study_dir):
+        # study 目录不可用时退化为「只挂这个序列」，OHIF 仍可查看单序列
+        study_dir = series_dir
+    study_uid = str(exam.get('study_instance_uid') or '')
+
+    if not study_uid:
+        return _library_error('该检查缺少 StudyInstanceUID，无法交给 OHIF 阅片')
+
+    file_id = library.register_series(series_dir, study_dir, {
+        'study_instance_uid': study_uid,
+        'series_instance_uid': series.get('series_instance_uid'),
+        'examination_id': exam.get('examination_id'),
+        'case_id': hit['case_id'],
+        'accession_number': exam.get('accession_number'),
+        'modality': exam.get('modality'),
+        'series_description': series.get('series_description'),
+        'series_number': series.get('series_number'),
+        'source': 'library',
+        'library_root': root.name,
+    })
+
+    # 只读文件头拼装 info：库内导入不需要像上传那样把像素全部解码，
+    # 体数据留给 /api/image/slice 与 /api/diagnose 按需加载。
+    paths = dicom_files(Path(series_dir))
+    if not paths:
+        return _library_error('序列目录内没有 .dcm 文件', 404)
+    try:
+        first = pydicom.dcmread(str(paths[0]), stop_before_pixels=True)
+    except Exception as exc:  # noqa: BLE001
+        return _library_error(f'无法读取 DICOM 头: {exc}', 500)
+
+    metadata = extract_dicom_metadata([first])
+    metadata['num_instances'] = len(paths)
+    rows = int(getattr(first, 'Rows', 0) or 0)
+    cols = int(getattr(first, 'Columns', 0) or 0)
+    pixel_spacing = getattr(first, 'PixelSpacing', None) or [1.0, 1.0]
+    thickness = _safe_float(getattr(first, 'SliceThickness', None), 1.0)
+
+    display_name = ' / '.join(filter(None, [
+        str(metadata.get('patient_id') or exam.get('accession_number') or ''),
+        (series.get('series_description') or '').strip(),
+        exam.get('study_description') or '',
+    ])) or os.path.basename(series_dir)
+
+    session['current_file_id'] = file_id
+    session['current_filepath'] = series_dir
+    return jsonify({
+        'success': True,
+        'file_id': file_id,
+        'message': f'已从影像库载入 {len(paths)} 张切片',
+        'info': {
+            'filename': display_name,
+            'file_type': 'dicom-series',
+            'upload_mode': 'library',
+            'source': 'library',
+            'library_root': root.name,
+            'uploaded_files': len(paths),
+            'slice_count': len(paths),
+            'shape': [len(paths), rows, cols],
+            'dtype': 'int16',
+            'size_mb': round(sum(_file_size(p) for p in paths) / 1024 / 1024, 2),
+            'spacing': {
+                'row': _safe_float(pixel_spacing[0], 1.0),
+                'column': _safe_float(pixel_spacing[1], 1.0),
+                'slice': thickness,
+            },
+            'metadata': metadata,
+            'ohif_study_uid': study_uid,
+            'series_dir': series_dir,
+            'study_dir': study_dir,
+            'case': {
+                'case_id': hit['case_id'],
+                'examination_id': exam.get('examination_id'),
+                'accession_number': exam.get('accession_number'),
+                'modality': exam.get('modality'),
+                'series_instance_uid': series.get('series_instance_uid'),
+                'series_description': series.get('series_description'),
+                'series_number': series.get('series_number'),
+            },
+        },
+    })
+
+
+def _file_size(path):
+    try:
+        return os.path.getsize(path)
+    except OSError:
+        return 0
+
+
+@app.route('/api/library/reports/<case_id>', methods=['GET'])
+def library_reports(case_id):
+    """病例关联报告全文（阅片时右侧对照原始报告用）。"""
+    library.refresh()
+    detail = library.case_detail(case_id)
+    if detail is None:
+        return _library_error('病例不存在', 404)
+    return jsonify({'success': True, 'data': detail['reports']})
+
+
+@app.route('/api/library/scan', methods=['POST'])
+def library_scan():
+    """扫描服务器上的任意 DICOM 目录（外部数据的服务器侧导入入口）。
+
+    与浏览器的 /api/upload 互补：数据已经在服务器上时，不必先下载到本地
+    再上传回去。只列目录、不复制文件，返回可选的序列清单。
+    """
+    payload = request.get_json(silent=True) or {}
+    target = (payload.get('path') or '').strip()
+    if not target:
+        return _library_error('缺少 path')
+    if not os.path.isdir(target):
+        return _library_error(f'目录不存在: {target}', 404)
+    try:
+        found = library.scan_directory(target)
+    except Exception as exc:  # noqa: BLE001
+        return _library_error(f'扫描失败: {exc}', 500)
+    return jsonify({'success': True, 'data': found})
+
+
+@app.route('/api/library/import_path', methods=['POST'])
+def library_import_path():
+    """登记 /api/library/scan 列出的某个序列目录，走与库内导入相同的链路。"""
+    payload = request.get_json(silent=True) or {}
+    series_dir = (payload.get('series_dir') or '').strip()
+    study_dir = (payload.get('study_dir') or '').strip() or series_dir
+    if not series_dir or not os.path.isdir(series_dir):
+        return _library_error(f'序列目录不存在: {series_dir}', 404)
+    paths = dicom_files(Path(series_dir))
+    if not paths:
+        return _library_error('该目录下没有 .dcm 文件', 404)
+    try:
+        first = pydicom.dcmread(str(paths[0]), stop_before_pixels=True)
+    except Exception as exc:  # noqa: BLE001
+        return _library_error(f'无法读取 DICOM 头: {exc}', 500)
+
+    study_uid = str(getattr(first, 'StudyInstanceUID', '') or '')
+    if not study_uid:
+        return _library_error('DICOM 缺少 StudyInstanceUID，无法交给 OHIF 阅片')
+    if not os.path.isdir(study_dir):
+        study_dir = series_dir
+
+    file_id = library.register_series(series_dir, study_dir, {
+        'study_instance_uid': study_uid,
+        'series_instance_uid': str(getattr(first, 'SeriesInstanceUID', '') or ''),
+        'source': 'external_path',
+        'series_description': str(getattr(first, 'SeriesDescription', '') or ''),
+        'series_number': getattr(first, 'SeriesNumber', None),
+    })
+    metadata = extract_dicom_metadata([first])
+    metadata['num_instances'] = len(paths)
+    rows = int(getattr(first, 'Rows', 0) or 0)
+    cols = int(getattr(first, 'Columns', 0) or 0)
+    pixel_spacing = getattr(first, 'PixelSpacing', None) or [1.0, 1.0]
+    thickness = _safe_float(getattr(first, 'SliceThickness', None), 1.0)
+
+    session['current_file_id'] = file_id
+    session['current_filepath'] = series_dir
+    return jsonify({
+        'success': True,
+        'file_id': file_id,
+        'message': f'已载入服务器目录 {len(paths)} 张切片',
+        'info': {
+            'filename': os.path.basename(series_dir.rstrip('/')) or series_dir,
+            'file_type': 'dicom-series',
+            'upload_mode': 'library',
+            'source': 'external_path',
+            'uploaded_files': len(paths),
+            'slice_count': len(paths),
+            'shape': [len(paths), rows, cols],
+            'dtype': 'int16',
+            'size_mb': round(sum(_file_size(p) for p in paths) / 1024 / 1024, 2),
+            'spacing': {
+                'row': _safe_float(pixel_spacing[0], 1.0),
+                'column': _safe_float(pixel_spacing[1], 1.0),
+                'slice': thickness,
+            },
+            'metadata': metadata,
+            'ohif_study_uid': study_uid,
+            'series_dir': series_dir,
+            'study_dir': study_dir,
+        },
+    })
+
+
+def _build_library_context(file_id, result):
+    """为院内影像库导入的病例组装溯源快照，随历史记录一起落库。
+
+    诊断结果本身不含「这是谁、哪次检查、哪个序列、原始报告怎么写」这些信息，
+    而院外报告复核恰恰需要它们。这里一次性抓齐并固化，历史记录即便日后影像库
+    被重新导出/移动，仍能回溯当时的病例与人工报告做对照。
+
+    返回 None 表示非库内病例（外部上传），不写 library_json。
+    """
+    entry = library.registry_entry(file_id)
+    if not entry:
+        return None
+
+    ctx = {
+        'library_root': entry.get('library_root'),
+        'case_id': entry.get('case_id'),
+        'examination_id': entry.get('examination_id'),
+        'series_instance_uid': entry.get('series_instance_uid'),
+        'accession_number': entry.get('accession_number'),
+        'series_description': entry.get('series_description'),
+        'series_number': entry.get('series_number'),
+        'study_instance_uid': entry.get('study_instance_uid'),
+        'series_dir': entry.get('series_dir'),
+        'ohif_study_uid': result.get('ohif_study_uid') or entry.get('study_instance_uid'),
+    }
+
+    # 病例级信息与原始报告全文：报告是 AI 对照的基准，必须固化
+    detail = None
+    try:
+        detail = library.case_detail(ctx['case_id'])
+    except Exception:  # noqa: BLE001 - 溯源失败不该阻断诊断落库
+        detail = None
+    if detail:
+        ctx['patient'] = {
+            'patient_name': detail.get('patient_name'),
+            'medical_record_no': detail.get('medical_record_no'),
+            'gender': detail.get('gender'),
+            'age': detail.get('age'),
+            'level1': detail.get('level1'),
+            'level2': detail.get('level2'),
+            'level3': detail.get('level3'),
+            'disease_name': detail.get('disease_name'),
+        }
+        ctx['reports'] = detail.get('reports') or []
+        for exam in detail.get('examinations') or []:
+            if exam.get('examination_id') != ctx['examination_id']:
+                continue
+            ctx['examination'] = {
+                'modality': exam.get('modality'),
+                'study_description': exam.get('study_description'),
+                'body_part_examined': exam.get('body_part_examined'),
+                'examination_date': exam.get('examination_date'),
+                'series_count': exam.get('series_count'),
+                'image_count': exam.get('image_count'),
+                'size_gb': exam.get('size_gb'),
+                'host_storage_path': exam.get('host_storage_path'),
+            }
+            # 只固化本次实际导入的那个序列，避免把整检查的序列清单都写进历史
+            for s in exam.get('series') or []:
+                if s.get('series_instance_uid') == ctx['series_instance_uid']:
+                    ctx['series'] = s
+                    break
+    return ctx
 
 
 def _spawn_fine_segmentation(file_id, dicom_dir):
@@ -1564,7 +2145,7 @@ def diagnose(file_id):
     执行AI诊断
     """
     try:
-        filepath = os.path.join(app.config['UPLOAD_FOLDER'], file_id)
+        filepath = resolve_file_path(file_id)
         if not os.path.exists(filepath):
             return jsonify({'success': False, 'message': '文件不存在'}), 404
 
@@ -1581,11 +2162,11 @@ def diagnose(file_id):
         overlay_path = os.path.join(
             app.config['UPLOAD_FOLDER'], 'radar_infer', file_id, 'overlay.npz'
         )
-        # 在独立子进程执行推理：主进程不常驻模型权重，避免常驻内存与推理
-        # 峰值叠加超出系统提交余量（实测独立进程可成功、常驻进程被守卫拦截）。
-        # 串行化：并发推理子进程互相抢占 CPU/内存，单次耗时翻倍触发 504。
+        # 推理走统一入口：优先常驻守护进程（权重只加载一次），守护不在或
+        # 崩溃时自动降级一次性子进程并后台重新拉起守护。串行化：并发推理
+        # 互相抢占 CPU/内存，单次耗时翻倍触发 504。
         with _DIAGNOSE_LOCK:
-            result, _organs, err = run_inference_subprocess(nifti_path, overlay_path)
+            result, _organs, err = run_inference(nifti_path, overlay_path)
         if err:
             status = 503 if '过大' in err or '内存' in err or '显存' in err else 500
             return jsonify({'success': False, 'message': f'诊断失败: {err}'}), status
@@ -1634,12 +2215,28 @@ def diagnose(file_id):
         patient_id = metadata.get('patient_id') or f"P{datetime.now().strftime('%Y%m%d%H%M%S')}"
         # 引擎内部使用的是临时NIfTI路径，这里统一替换为面向用户的患者ID
         result['patient_id'] = patient_id
+        # 库内导入的 filepath 是 <series_uid> 目录，直接取 basename 会在历史记录里
+        # 显示成一串 UID（如 1.2.840.113619...），不可读。用注册表里的检查号/序列名
+        # 拼一个有意义的名字，与上传病例的 file_name 展示保持一致的可读性。
+        display_name = os.path.basename(filepath)
+        lib_entry = library.registry_entry(file_id)
+        if lib_entry:
+            parts = [
+                lib_entry.get('accession_number'),
+                (lib_entry.get('series_description') or '').strip(),
+            ]
+            display_name = ' · '.join(p for p in parts if p) or display_name
+        # 库内导入附带溯源快照（病例/检查/序列 + 原始报告全文），外部上传为 None
+        lib_context = _build_library_context(file_id, result)
         case_id = history_manager.add_case(
             patient_id=patient_id,
-            file_name=os.path.basename(filepath),
+            file_name=display_name,
             file_path=filepath,
             diagnosis_result=result,
-            metadata={'image_shape': list(image_data.shape), 'file_type': file_type}
+            metadata={'image_shape': list(image_data.shape), 'file_type': file_type},
+            file_id=file_id,
+            source='library' if lib_entry else 'upload',
+            library_context=lib_context,
         )
         
         # 保存到session
@@ -1701,6 +2298,23 @@ def prepare_nifti_for_inference(file_id, filepath, image_data, geometry=None):
     return nifti_path
 
 
+@app.route('/api/client_diag', methods=['POST'])
+def client_diag():
+    """接收前端浏览器环境诊断并写入服务日志。
+
+    阅片视口卡 Loading 这类问题只发生在用户浏览器里（WebGL2 不可用、
+    扩展拦截等），服务端日志看不到任何异常。前端打开查看器时把环境
+    快照 POST 上来，出问题时直接查 flask.log 即可定位，不必让用户
+    手动翻控制台。只记日志、不落库，内容全部来自前端自报。
+    """
+    payload = request.get_json(silent=True) or {}
+    safe = {k: payload.get(k) for k in
+            ('webgl2', 'webgl1', 'user_agent', 'study_uid', 'canvas_count',
+             'viewport_loading', 'cross_origin_isolated', 'shared_array_buffer')}
+    app.logger.info('[client-diag] %s', json.dumps(safe, ensure_ascii=False))
+    return jsonify({'success': True})
+
+
 @app.route('/api/settings', methods=['GET', 'POST', 'PUT'])
 def settings_api():
     if request.method == 'GET':
@@ -1721,7 +2335,27 @@ def settings_api():
             settings['use_gpu'] = bool(payload['use_gpu'])
         if 'viewer_source' in payload and payload['viewer_source'] in {'local5000'}:
             settings['viewer_source'] = payload['viewer_source']
+        if 'library_roots' in payload:
+            roots = payload['library_roots']
+            if not isinstance(roots, list):
+                raise ValueError('library_roots 必须是数组')
+            cleaned = []
+            for item in roots:
+                entry = item if isinstance(item, dict) else {'path': item}
+                path = str(entry.get('path') or '').strip()
+                if not path:
+                    continue
+                if not os.path.isdir(path):
+                    raise ValueError(f'影像库目录不存在: {path}')
+                cleaned.append({'name': entry.get('name') or os.path.basename(path),
+                                'path': path})
+            if not cleaned:
+                raise ValueError('至少需要一个有效的影像库目录')
+            settings['library_roots'] = cleaned
         write_settings(settings)
+        # 库目录变了必须重新装载，否则本次进程仍用旧索引（要重启才生效）
+        library.configure(resolve_library_roots(), LIBRARY_REGISTRY_FILE)
+        library.refresh()
         return jsonify({'success': True, 'settings': settings, 'message': '设置已保存'})
     except (TypeError, ValueError, OSError) as e:
         return jsonify({'success': False, 'message': f'保存设置失败: {str(e)}'}), 400
@@ -1980,15 +2614,32 @@ def _build_report_evidence(file_id, diagnosis_result, limit=4):
 
 @app.route('/api/report/generate', methods=['POST'])
 def generate_report():
-    """生成PDF诊断报告（含患者信息与CT影像证据截图）。"""
+    """生成PDF诊断报告（含患者信息与CT影像证据截图）。
+
+    两种取数方式：
+    1. 直接传 diagnosis_result（诊断刚完成，前端手上有完整结果）
+    2. 只传 case_id（历史记录复核）——从库里读回完整诊断结果，
+       这样升级后保存的完整记录才能真正用于事后出报告。
+    """
     try:
         data = request.get_json()
         diagnosis_result = data.get('diagnosis_result')
         patient_info = data.get('patient_info', {})
         file_id = data.get('file_id')
+        case_id = data.get('case_id')
+
+        if not diagnosis_result and case_id:
+            detail = history_manager.get_full_diagnosis(int(case_id)) or {}
+            diagnosis_result = detail.get('diagnosis')
+            # 库内病例带上原始报告溯源，报告里可标注「院内教学库对照」
+            if not patient_info and detail.get('library_context'):
+                patient_info = detail['library_context'].get('patient') or {}
+            if not file_id:
+                file_id = detail.get('file_id')
 
         if not diagnosis_result:
-            return jsonify({'success': False, 'message': '缺少诊断结果'}), 400
+            return jsonify({'success': False,
+                            'message': '缺少诊断结果（该历史记录未保存完整诊断数据，无法重新生成报告）'}), 400
 
         pdf_path = os.path.join(
             app.config['UPLOAD_FOLDER'],
@@ -2019,7 +2670,7 @@ def generate_report():
 @app.route('/api/history', methods=['GET'])
 def get_history():
     """
-    获取历史记录列表
+    获取历史记录列表（只返回小体积摘要，完整结果走 /api/history/<case_id>）
     """
     try:
         limit = request.args.get('limit', 50, type=int)
@@ -2030,21 +2681,27 @@ def get_history():
 
         history_list = []
         for case in cases:
-            detail = history_manager.get_case(case['id']) or {}
-            diagnoses = detail.get('diagnoses', [])
-            findings = [f"{d['organ']}-{d['finding']}" for d in diagnoses]
+            summary = case.get('summary') or {}
             history_list.append({
                 'id': case['id'],
                 'case_id': case['id'],
                 'patient_id': case['patient_id'],
                 'file_name': case['file_name'],
+                'file_id': case.get('file_id'),
+                # 老记录没有存过来源（NULL），原样返回让前端显示「来源未记录」，
+                # 不要兜底成 'upload'——那会把库内导入的老病例误标成外部导入。
+                'source': case.get('source'),
                 'status': case.get('status'),
                 'timestamp': case.get('upload_time'),
-                'organs_detected': detail.get('organs_detected', []),
+                'risk_level': case.get('risk_level') or summary.get('risk_level'),
+                'processing_time': case.get('processing_time') or summary.get('processing_time'),
+                'findings_count': summary.get('findings_count'),
+                'organs_detected_count': summary.get('organs_detected_count'),
+                'warnings': summary.get('warnings') or [],
                 'diagnosis': {
                     # 前端展示的“诊断结论”摘要
-                    'diagnosis': '、'.join(findings) if findings else '未发现达到阈值的异常',
-                    'diagnoses': diagnoses,
+                    'diagnosis': summary.get('diagnosis') or '未发现达到阈值的异常',
+                    'diagnoses': summary.get('diagnoses') or [],
                 }
             })
 
@@ -2056,6 +2713,47 @@ def get_history():
 
     except Exception as e:
         return jsonify({'success': False, 'message': f'获取历史记录失败: {str(e)}'}), 500
+
+
+@app.route('/api/history/<int:case_id>', methods=['GET'])
+def get_history_detail(case_id):
+    """获取单条历史记录的完整诊断结果。
+
+    列表页只带摘要以控制传输与内存；详情、报告复核、重新出 PDF 都走这里。
+    库内病例额外返回 library_context（病例溯源 + 原始报告全文），前端可直接
+    复原「AI 结果 vs 人工报告」对照，无需影像库仍在线。
+    """
+    try:
+        case = history_manager.get_case(case_id)
+        if not case:
+            return jsonify({'success': False, 'message': '记录不存在'}), 404
+
+        summary = case.get('summary') or {}
+        full = case.get('diagnosis')
+        return jsonify({
+            'success': True,
+            'record': {
+                'id': case['id'],
+                'case_id': case['id'],
+                'patient_id': case['patient_id'],
+                'file_name': case['file_name'],
+                'file_id': case.get('file_id'),
+                'source': case.get('source'),
+                'status': case.get('status'),
+                'timestamp': case.get('upload_time'),
+                'notes': case.get('notes'),
+                'processing_time': case.get('processing_time'),
+                'summary': summary,
+                'organs_detected': case.get('organs_detected') or [],
+                'metadata': case.get('metadata') or {},
+                'library_context': case.get('library_context'),
+                # 完整诊断结果；升级前的老记录没有存过，返回 None 由前端降级提示
+                'diagnosis': full,
+                'has_full_result': full is not None,
+            }
+        })
+    except Exception as e:
+        return jsonify({'success': False, 'message': f'获取历史记录详情失败: {str(e)}'}), 500
 
 
 @app.route('/api/batch/upload', methods=['POST'])
@@ -2443,6 +3141,10 @@ if __name__ == '__main__':
     # 就会重启 worker，把正在处理的请求连连接一起掐断（客户端表现为 HTTP 000 /
     # curl exit 56，即「诊断失败」且进程像崩溃了一样）。
     threading.Thread(target=warmup_inference_engine, name='radar-warmup',
+                     daemon=True).start()
+    # 首次启动即拉起常驻推理守护进程：模型权重只加载一次，后续诊断全部复用，
+    # 不再「用一次重新加载一次」。加载期间到达的诊断自动走一次性子进程兜底。
+    threading.Thread(target=ensure_infer_daemon, name='radar-infer-daemon',
                      daemon=True).start()
     # 必须开多线程：Werkzeug 开发服务器默认 threaded=False（单线程串行处理），
     # 而 OHIF viewer 打开一个 study 会并发预取 25~100 个 /frames/<n> 请求。

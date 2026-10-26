@@ -13,6 +13,8 @@ logs/
 .torch_cu126/
 results/
 radar_history.db
+radar_history.db.bak-*
+flask-app/library_registry.json
 *.log
 
 # ---------- 模型权重（用 download_scripts/download_checkpoints.py 从 HuggingFace 获取） ----------

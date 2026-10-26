@@ -1,8 +1,9 @@
 // RADAR医学影像诊断平台 - 前端交互逻辑
 
-// OHIF 查看器端口。默认 3001，需与后端 app.py 的 OHIF_PORT 及
-// start_radar_system.ps1 的 $OhifPort 保持一致（3000 已被本机 Docker 的 attu 占用）。
-const OHIF_PORT = 3001;
+// OHIF 查看器端口。默认 3002，需与后端 app.py 的 OHIF_PORT 及
+// start_radar_system.ps1 的 $OhifPort 保持一致
+// （3000=grafana、3001=bzh-server 均被本机 Docker 容器占用）。
+const OHIF_PORT = 3002;
 
 // 全局状态
 const AppState = {
@@ -27,10 +28,25 @@ document.addEventListener('DOMContentLoaded', () => {
     initUpload();
     initViewer();
     initDiagnose();
+    if (typeof initLibrary === 'function') initLibrary();
+    initHistoryDetailDrawer();
     initSettings();
     loadSettings();
     loadHistory();
 });
+
+// 历史详情抽屉的关闭交互（遮罩/✕/Esc）。与影像库抽屉各自独立，
+// 因为两个抽屉可能在同一页面栈上，关闭判断只认自己那个。
+function initHistoryDetailDrawer() {
+    const drawer = document.getElementById('historyDrawer');
+    if (!drawer) return;
+    drawer.addEventListener('click', (e) => {
+        if (e.target.closest('[data-hist-close]')) closeHistoryDetail();
+    });
+    document.addEventListener('keydown', (e) => {
+        if (e.key === 'Escape' && !drawer.hidden) closeHistoryDetail();
+    });
+}
 
 // ============ 导航功能 ============
 function initNavigation() {
@@ -53,6 +69,9 @@ function initNavigation() {
             // 加载页面数据
             if (targetPage === 'history') {
                 loadHistory();
+            } else if (targetPage === 'library') {
+                // 首次进入才拉索引；后续切回直接用内存里的树与列表，避免重复扫盘
+                if (!LibStateLoaded) { LibStateLoaded = true; refreshLibrary(false); }
             }
         });
     });
@@ -244,9 +263,45 @@ function openOhifViewer(studyUid) {
         showToast('未生成OHIF研究数据', 'error');
         return;
     }
-    const viewerUrl = `http://127.0.0.1:${OHIF_PORT}/viewer/local5000?StudyInstanceUIDs=${encodeURIComponent(studyUid)}`;
+    // OHIF 主视口（Cornerstone3D）必须创建 WebGL2 上下文；无显卡/远程桌面等
+    // 环境里新版 Chrome 默认禁用软件 WebGL 回退，WebGL2 拿不到，视口会永远停在
+    // Loading（缩略图走 2D canvas 不受影响，容易误判成"数据没加载"）。
+    // 打开查看器前先探测一次，不可用就直接给出原因和修复办法，别让用户干等。
+    const warn = document.getElementById('webglWarn');
+    if (warn) {
+        let webgl2 = false;
+        try {
+            webgl2 = !!document.createElement('canvas').getContext('webgl2');
+        } catch (e) { /* 探测失败按不可用处理 */ }
+        warn.hidden = webgl2;
+    }
+    // 用 location.hostname 而不是写死 127.0.0.1：用户从远程（如 10.101.1.178:5000）
+    // 打开本页时，iframe 指向 127.0.0.1 会打到用户自己机器上，根本连不上 OHIF。
+    // OHIF 的 /dicomweb 是相对路径代理回 Flask，所以同源 hostname 才是对的。
+    const viewerUrl = `http://${window.location.hostname}:${OHIF_PORT}/viewer/local5000?StudyInstanceUIDs=${encodeURIComponent(studyUid)}`;
     document.getElementById('ohifViewerFrame').src = viewerUrl;
     document.getElementById('openOhifNewTab').href = viewerUrl;
+
+    // 把浏览器渲染环境快照上报到服务日志：视口卡 Loading 只发生在用户浏览器里，
+    // 服务端接口全 200 也看不出问题。有了这份快照，出问题时查 flask.log 的
+    // [client-diag] 即可定位（WebGL2 是否可用、浏览器版本等），不用用户翻控制台。
+    let dWebgl2 = false, dWebgl1 = false;
+    try {
+        dWebgl2 = !!document.createElement('canvas').getContext('webgl2');
+        dWebgl1 = !!document.createElement('canvas').getContext('webgl');
+    } catch (e) { /* 探测失败按不可用上报 */ }
+    fetch('/api/client_diag', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+            webgl2: dWebgl2,
+            webgl1: dWebgl1,
+            user_agent: navigator.userAgent,
+            study_uid: studyUid,
+            cross_origin_isolated: window.crossOriginIsolated === true,
+            shared_array_buffer: typeof SharedArrayBuffer !== 'undefined',
+        }),
+    }).catch(() => { /* 诊断上报失败不影响主流程 */ });
 }
 
 function displayFileInfo(info) {
@@ -809,6 +864,11 @@ function displayDiagnosisResult(result) {
 
     // 分割叠加交互看片（依赖诊断时导出的 overlay.npz）
     initOverlayViewer(result);
+
+    // 库内病例：把 AI 发现同步到「院内原始报告对照」卡右侧
+    if (typeof renderAiSummaryIntoCompare === 'function') {
+        renderAiSummaryIntoCompare(result, diagnoses);
+    }
 
     section.scrollIntoView({ behavior: 'smooth' });
 }
@@ -1805,17 +1865,198 @@ function displayHistory(records) {
     records.forEach(record => {
         const item = document.createElement('div');
         item.className = 'history-item';
+        item.style.borderLeftColor = RISK_COLOR[record.risk_level] || 'var(--primary)';
+        // 列表接口只带摘要，这里不渲染大字段；点击才去拉完整诊断结果
         item.innerHTML = `
             <div style="display: flex; justify-content: space-between; margin-bottom: 0.5rem;">
-                <strong>患者ID: ${record.patient_id}</strong>
-                <span style="color: var(--text-secondary);">${record.timestamp}</span>
+                <strong>患者ID: ${escapeHtml(record.patient_id || '-')}</strong>
+                <span style="color: var(--text-secondary);">${escapeHtml(record.timestamp || '')}</span>
+            </div>
+            <div class="history-item-file">
+                ${escapeHtml(record.file_name || '-')}
             </div>
             <div style="color: var(--text-secondary);">
-                诊断结论: ${record.diagnosis.diagnosis || '无'}
+                诊断结论: ${escapeHtml(record.diagnosis.diagnosis || '无')}
+            </div>
+            <div class="history-item-meta">
+                ${sourceTag(record.source)}
+                ${riskBadge(record.risk_level)}
+                ${record.findings_count != null ? `<span class="history-tag">${record.findings_count} 项发现</span>` : ''}
+                ${record.organs_detected_count ? `<span class="history-tag muted">${record.organs_detected_count} 器官</span>` : ''}
+                ${record.processing_time ? `<span class="history-tag muted">${Number(record.processing_time).toFixed(1)}s</span>` : ''}
+                ${(record.warnings || []).length ? `<span class="history-tag muted">${record.warnings.length} 条警告</span>` : ''}
             </div>
         `;
+        item.addEventListener('click', () => openHistoryDetail(record.case_id));
         historyList.appendChild(item);
     });
+}
+
+const RISK_COLOR = {
+    high: 'var(--danger, #dc2626)',
+    medium: 'var(--warning, #d97706)',
+    low: 'var(--primary)',
+    none: 'var(--text-tertiary)',
+};
+
+function riskBadge(level) {
+    const label = { high: '高风险', medium: '中风险', low: '低风险', none: '无显著异常' }[level] || '-';
+    return `<span class="history-tag" style="border-color:${RISK_COLOR[level] || 'var(--border-color)'};color:${RISK_COLOR[level] || 'var(--text-secondary)'}">${label}</span>`;
+}
+
+// 升级前的老记录没有存 file_id，来源无从判定（数据库里是 NULL）。
+// 这种情况显示「来源未记录」，而不是误标成「外部导入」。
+function sourceTag(source) {
+    if (source === 'library') return '<span class="history-tag">院内影像库</span>';
+    if (source === 'upload') return '<span class="history-tag muted">外部导入</span>';
+    return '<span class="history-tag muted">来源未记录</span>';
+}
+
+function sourceLabel(source) {
+    return { library: '院内影像库', upload: '外部导入' }[source] || '来源未记录';
+}
+
+// ==================== 历史记录详情（完整诊断结果） ====================
+// 列表只传小摘要，完整结果（explanation / top_scores / warnings / metadata /
+// 原始报告）在此按需加载，避免历史记录一多就把整库拖到浏览器。
+async function openHistoryDetail(caseId) {
+    const drawer = document.getElementById('historyDrawer');
+    const body = document.getElementById('histDrawerBody');
+    if (!drawer || !body) return;
+    drawer.hidden = false;
+    document.body.classList.add('drawer-open');
+    document.getElementById('histDrawerTitle').textContent = '诊断记录详情';
+    document.getElementById('histDrawerSub').textContent = '加载中…';
+    body.innerHTML = '<div class="lib-empty">加载中…</div>';
+
+    try {
+        const res = await fetch('/api/history/' + encodeURIComponent(caseId));
+        const data = await res.json();
+        if (!data.success) throw new Error(data.message || '记录不存在');
+        const r = data.record;
+        renderHistoryDetail(r);
+    } catch (err) {
+        console.error('[history] detail failed', err);
+        body.innerHTML = `<div class="lib-empty">${escapeHtml(err.message)}</div>`;
+    }
+}
+
+function closeHistoryDetail() {
+    const drawer = document.getElementById('historyDrawer');
+    if (drawer) drawer.hidden = true;
+    document.body.classList.remove('drawer-open');
+}
+
+function renderHistoryDetail(r) {
+    const body = document.getElementById('histDrawerBody');
+    const d = r.diagnosis;
+    const lib = r.library_context;
+    const p = (lib && lib.patient) || {};
+
+    document.getElementById('histDrawerTitle').textContent =
+        `${p.patient_name || r.patient_id || '匿名'} · ${p.medical_record_no || lib?.accession_number || r.patient_id || ''}`;
+    document.getElementById('histDrawerSub').textContent = [
+        r.timestamp, r.file_name,
+        sourceLabel(r.source),
+        d?.engine || '', r.processing_time ? `${Number(r.processing_time).toFixed(1)}s` : '',
+    ].filter(Boolean).join(' · ');
+
+    // 左栏：完整诊断结果（含推理依据与警告，这些都不在列表摘要里）
+    const left = [];
+    left.push(histSection('诊断结论', histDiagnosisRows(d?.diagnoses || r.summary?.diagnoses || [])));
+    if (d?.warnings?.length) {
+        left.push(histSection('输入质量警告',
+            d.warnings.map((w) => `<div class="hist-warn">${escapeHtml(typeof w === 'string' ? w : (w.message || JSON.stringify(w)))}</div>`).join('')));
+    }
+    if (r.organs_detected?.length) {
+        left.push(histSection(`检出器官（${r.organs_detected.length}）`,
+            `<div class="hist-organ-chips">${r.organs_detected.map((o) => `<span>${escapeHtml(o)}</span>`).join('')}</div>`));
+    }
+    if (d?.explanation) {
+        const e = d.explanation;
+        const top = (e.top_scores || []).map((t) =>
+            `<div class="hist-top-row"><span>${escapeHtml(t.item)}</span><b>${(t.confidence * 100).toFixed(1)}%</b></div>`).join('');
+        left.push(histSection('推理依据',
+            `${e.method ? `<div class="hist-text">${escapeHtml(e.method)}</div>` : ''}
+             ${e.summary ? `<div class="hist-text muted">${escapeHtml(e.summary)}</div>` : ''}
+             ${top ? `<div class="hist-top-title">置信度 Top ${e.top_scores.length}（共 ${e.total_items || '-'} 项）</div>${top}` : ''}
+             ${e.limitations?.length ? `<div class="hist-text muted">局限：${e.limitations.map(escapeHtml).join('；')}</div>` : ''}`));
+    }
+    if (!d) {
+        left.push(histSection('完整诊断结果',
+            '<div class="lib-empty">该记录产生于升级前，仅保存了结论摘要，未留存推理依据与警告等完整数据。重新导入影像并诊断即可获得完整记录。</div>'));
+    }
+    // 元数据与诊断页一致：用 label_map 显示中文字段名并按其顺序排列，
+    // 控制键（label_map/source/num_instances）不参与展示。
+    // 完整 DICOM 元数据在 diagnosis_json.metadata 里（入库时已合并 image_shape/
+    // file_type）；r.metadata 只是关系表里的少量键值对，作为老记录的兜底。
+    const meta = (d && d.metadata) || r.metadata || {};
+    const labelMap = meta.label_map || {};
+    const metaOrder = Object.keys(labelMap);
+    const metaKeys = Object.keys(meta)
+        .filter((k) => !META_CONTROL_KEYS.has(k) && meta[k] && typeof meta[k] !== 'object')
+        .sort((a, b) => {
+            const ia = metaOrder.indexOf(a), ib = metaOrder.indexOf(b);
+            return (ia === -1 ? metaOrder.length : ia) - (ib === -1 ? metaOrder.length : ib);
+        });
+    if (metaKeys.length) {
+        left.push(histSection('影像元数据', metaKeys.map((k) =>
+            `<div class="hist-meta-row"><span>${escapeHtml(labelMap[k] || k)}</span><b>${escapeHtml(String(meta[k]))}</b></div>`).join('')));
+    }
+
+    // 右栏：库内病例的溯源与原始报告（入库时已固化，影像库离线也能看）
+    const right = [];
+    if (lib) {
+        const rows = [
+            ['教学库', lib.library_root],
+            ['检查号', lib.accession_number],
+            ['检查', lib.examination && `${lib.examination.modality || ''} ${lib.examination.study_description || ''}`.trim()],
+            ['检查日期', lib.examination && lib.examination.examination_date],
+            ['导入序列', lib.series_description ? `#${lib.series_number ?? ''} ${lib.series_description}` : ''],
+            ['序列规模', lib.examination && `${lib.examination.series_count || '-'} 序列 / ${lib.examination.image_count || '-'} 张 / ${lib.examination.size_gb || '-'} GB`],
+            ['分类', [p.level1, p.level2, p.level3].filter(Boolean).join(' / ')],
+            ['疾病', p.disease_name],
+            ['file_id', r.file_id],
+        ].filter(([, v]) => v);
+        right.push(histSection('影像溯源',
+            rows.map(([k, v]) => `<div class="hist-meta-row"><span>${escapeHtml(k)}</span><b>${escapeHtml(String(v))}</b></div>`).join('')));
+    }
+    if (lib?.reports?.length) {
+        right.push(histSection(`原始报告（${lib.reports.length} 份）`,
+            `<div class="lib-report-list">${renderReportItems(lib.reports)}</div>`));
+    }
+    if (!right.length) {
+        // 外部导入的病例本就没有溯源；升级前的老记录同样没有
+        right.push(histSection('影像溯源',
+            `<div class="lib-empty">该记录没有院内影像库溯源信息（${sourceLabel(r.source)}）。</div>`));
+    }
+
+    body.innerHTML = `
+        <div class="lib-drawer-col">${left.join('')}</div>
+        <div class="lib-drawer-col">${right.join('')}</div>
+    `;
+}
+
+function histSection(title, inner) {
+    return `<div class="hist-section">
+        <div class="lib-section-head"><h4>${escapeHtml(title)}</h4></div>
+        ${inner}
+    </div>`;
+}
+
+function histDiagnosisRows(diagnoses) {
+    if (!diagnoses.length) return '<div class="lib-empty">未发现达到阈值的异常</div>';
+    return diagnoses.map((x) => `
+        <div class="hist-diag-row">
+            <div class="hist-diag-head">
+                <span class="hist-diag-organ">${escapeHtml(x.organ || '-')}</span>
+                <span class="hist-diag-finding">${escapeHtml(x.finding || '-')}</span>
+                <span class="hist-diag-sev sev-${escapeHtml(x.severity || 'low')}">${escapeHtml({ high: '高', medium: '中', low: '低' }[x.severity] || '-')}</span>
+                ${x.confidence != null ? `<span class="hist-diag-conf">${(x.confidence * 100).toFixed(1)}%</span>` : ''}
+            </div>
+            ${x.evidence ? `<div class="hist-text muted">${escapeHtml(x.evidence)}</div>` : ''}
+            ${x.recommendation ? `<div class="hist-text">${escapeHtml(x.recommendation)}</div>` : ''}
+        </div>`).join('');
 }
 
 // ============ 批量处理 ============
